@@ -1,29 +1,26 @@
 import pandas as pd
-import re
 
 
 def load_catalog(path: str) -> list[str]:
+    """
+    Loads the Hoffmann catalog.
+    First column (Artikelnummer) contains the full reference,
+    e.g. '759800', '759856 600', '082812 M12', '640190 1/2'.
+    """
     df = pd.read_excel(path, dtype=str)
+    if df.empty:
+        return []
     col = df.columns[0]
-    refs = df[col].dropna().str.strip().tolist()
+    refs = df[col].dropna().astype(str).str.strip().tolist()
+    # Skip header-like rows
+    refs = [r for r in refs if r and r.lower() not in ("article number", "artikelnummer")]
+    # Sort longest first so "642229 8" matches before "642229"
     refs.sort(key=len, reverse=True)
     return refs
 
 
-def find_reference(text: str, catalog: list[str]) -> str | None:
-    text_upper = text.upper()
-    for ref in catalog:
-        ref_upper = ref.upper()
-        pattern = r'(?<![A-Z0-9])' + re.escape(ref_upper) + r'(?![A-Z0-9/])'
-        if re.search(pattern, text_upper):
-            return ref
-
-    article_pattern = r'(?:art[ií]culo|article|item|n[r°º]\.?|num\.?)\s*:?\s*([A-Z0-9]+(?:\s+[A-Z0-9/]+)?)'
-    match = re.search(article_pattern, text_upper)
-    if match:
-        candidate = match.group(1).strip()
-        for ref in catalog:
-            if ref.upper() == candidate:
-                return ref
-
-    return None
+def validate_reference(ref: str, catalog: list[str]) -> bool:
+    """Returns True if the reference exists in the catalog."""
+    if not catalog:
+        return True  # no catalog loaded -> don't block
+    return ref in catalog
