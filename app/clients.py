@@ -104,3 +104,4 @@ def find_client(delivery_address: str, clients: list[dict]) -> dict:
         }
 
     return empty
+
