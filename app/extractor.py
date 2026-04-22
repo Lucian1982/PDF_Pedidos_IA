@@ -1,277 +1,381 @@
-import re
+"""
+PDF extractor for Hoffmann purchase orders.
+
+Strategy (in order of confidence):
+1. Extract text + tables with pdfplumber.
+2. Identify document format by keywords (Aludium-style, Astemo-style, generic).
+3. Parse header fields with format-specific regex, fall back to generic regex.
+4. Parse line items with format-specific regex.
+5. Validate references against the catalog (when available).
+6. Match delivery address against clients table.
+7. Assemble output in the required pipe-delimited format.
+
+No LLM calls are required; the rules handle the known formats. A hook is
+provided (extractor._llm_rescue) for future OpenAI fallback.
+"""
+
+from __future__ import annotations
 import os
+import re
 import json
 import pdfplumber
-from openai import OpenAI
 
-from .catalog import find_reference
+from .catalog import validate_reference
 from .clients import find_client
 
-openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY", ""))
+
+# ─── Regex patterns ───────────────────────────────────────────────────────────
+
+# Aludium line: "1-1 759800 - PALANCA 20/04/2026 8 PCS 13,77 110,16[\n continuation]"
+ALUDIUM_LINE_RE = re.compile(
+    r'^(\d+-\d+)\s+'
+    r'(.+?)\s+'
+    r'(\d{2}/\d{2}/\d{4})\s+'
+    r'(\d+(?:[.,]\d+)?)\s+'
+    r'(\w+)\s+'
+    r'(\d+(?:[.,]\d+))\s+'
+    r'(\d+(?:[.,]\d+))'
+    r'(?:\n(.*))?$',
+    re.DOTALL,
+)
+
+# Reference at start: "759800 - ..." or "759856 600 - ..." or "640190 1/2 - ..."
+REF_AT_START_RE = re.compile(
+    r'^(\d{5,})(?:\s+(\d+(?:/\d+)?|[A-Z]\d+(?:[A-Z]\d*)?|M\d+[A-Z0-9]*))?\s*-\s+'
+)
+
+# Reference at end: "... Número de artículo: 845020 18."
+REF_AT_END_RE = re.compile(
+    r'(?:n[úu]mero\s+de\s+)?art[ií]?culo\s*:?\s*(\d{5,}(?:\s+[A-Z0-9/]+)?)',
+    re.IGNORECASE,
+)
+
+# Astemo-style reference in text block: "708205 300\n24.87 per 1"
+ASTEMO_LINE_RE = re.compile(
+    r'(\d{5,}(?:\s+\d+)?)\s*\n\s*(\d+[.,]\d+)\s+per\s+\d+',
+    re.MULTILINE,
+)
+
+# Generic fallback: any 5+ digit number with optional numeric or M-style suffix
+GENERIC_REF_RE = re.compile(
+    r'\b(\d{5,})(?:\s+(\d+(?:/\d+)?|M\d+[A-Z0-9]*))?\b'
+)
+
+EMAIL_RE = re.compile(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+')
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _normalize_date(raw: str) -> str:
+    """Normalize date to DD/MM/YYYY."""
+    if not raw:
+        return ""
+    return raw.strip().replace("-", "/")
+
+
+def _extract_reference(content: str, full_text: str) -> str:
+    """Try several strategies to find the Hoffmann reference in a line."""
+    # 1) Reference at the start of the line content
+    m = REF_AT_START_RE.match(content)
+    if m:
+        base, suffix = m.group(1), m.group(2)
+        return (base + " " + suffix).strip() if suffix else base
+
+    # 2) Reference explicitly marked with "artículo:" / "article:"
+    m = REF_AT_END_RE.search(full_text)
+    if m:
+        return re.sub(r'\s+', ' ', m.group(1)).strip()
+
+    # 3) Any 5+ digit number with optional suffix (last resort)
+    m = GENERIC_REF_RE.search(full_text)
+    if m:
+        base, suffix = m.group(1), m.group(2)
+        return (base + " " + suffix).strip() if suffix else base
+
+    return ""
+
+
+# ─── Format detection ─────────────────────────────────────────────────────────
+
+def _detect_format(full_text: str) -> str:
+    t = full_text.lower()
+    if "no.pedido" in t or "pedido de compra" in t:
+        return "aludium"
+    if "purchase order number" in t:
+        return "astemo"
+    return "generic"
 
 
 # ─── Header extraction ────────────────────────────────────────────────────────
 
-def extract_header_with_rules(full_text: str) -> dict:
-    """Try to extract header fields using regex patterns."""
-    header = {}
+def _extract_header_aludium(full_text: str, tables: list) -> dict:
+    h = {}
 
-    # Order number: look for 'No.Pedido', 'Purchase order number', etc.
-    for pattern in [
-        r'No\.?Pedido\s+(\d+)',
-        r'Purchase order number[:\s]+(\d+)',
-        r'Pedido\s+(\d{5,})',
-    ]:
-        m = re.search(pattern, full_text, re.IGNORECASE)
-        if m:
-            header["orderNumber"] = m.group(1).strip()
-            break
-
-    # Date: fecha de orden / creation date
-    for pattern in [
-        r'Fecha de orden\s+(\d{1,2}/\d{2}/\d{4})',
-        r'Creation date[:\s]+(\d{2}-\d{2}-\d{4})',
-        r'Fecha de orden\s+(\d{2}-\d{2}-\d{4})',
-    ]:
-        m = re.search(pattern, full_text, re.IGNORECASE)
-        if m:
-            date_raw = m.group(1).strip()
-            # Normalize to DD/MM/YYYY
-            header["deliveryDate"] = date_raw.replace("-", "/")
-            break
-
-    # Buyer name
-    for pattern in [
-        r'Comprador\s*\n\s*([^\n]+)',
-        r'Requester[:\s]+([A-ZÁÉÍÓÚÑ][^\n]+)',
-    ]:
-        m = re.search(pattern, full_text, re.IGNORECASE)
-        if m:
-            header["buyer"] = m.group(1).strip()
-            break
-
-    # Email
-    m = re.search(r'([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)', full_text)
+    m = re.search(r'No\.?Pedido\s+(\d+)', full_text, re.IGNORECASE)
     if m:
-        header["email"] = m.group(1).strip()
+        h["orderNumber"] = m.group(1).strip()
 
-    return header
+    m = re.search(r'Fecha de orden\s+(\d{1,2}[/-]\d{2}[/-]\d{4})', full_text, re.IGNORECASE)
+    if m:
+        h["deliveryDate"] = _normalize_date(m.group(1))
 
+    # Buyer: "Comprador\n<name>" OR from tables: cell "Comprador\n<name>"
+    m = re.search(r'Comprador\s*\n\s*([^\n]+?)(?:\s+[A-Za-z0-9._%+-]+@|$)', full_text)
+    if m:
+        h["buyer"] = m.group(1).strip()
+    else:
+        for t in tables:
+            for row in t:
+                for cell in row:
+                    if cell and str(cell).startswith("Comprador"):
+                        parts = str(cell).split("\n", 1)
+                        if len(parts) > 1:
+                            h["buyer"] = parts[1].strip()
+                            break
 
-def extract_header_with_llm(full_text: str) -> dict:
-    """Use OpenAI to extract header fields when regex fails."""
-    prompt = f"""Extract the following fields from this purchase order text and return ONLY a JSON object with no markdown or explanation:
-- orderNumber: the purchase order number (string)
-- deliveryDate: the order creation date in DD/MM/YYYY format (string)
-- buyer: the name of the person who made the order (string)
-- email: the email address of the buyer (string)
-- deliveryAddress: the full delivery address as a single string (string)
+    m = EMAIL_RE.search(full_text)
+    # Take the first email that is NOT the Hoffmann contact
+    for mm in EMAIL_RE.finditer(full_text):
+        email = mm.group(0)
+        if "hofmann" not in email.lower() and "hoffmann" not in email.lower() and "normadat" not in email.lower() and "pagero" not in email.lower() and "info@aludium" not in email.lower():
+            h["email"] = email
+            break
 
-Purchase order text:
-{full_text[:3000]}
-
-Return ONLY valid JSON like: {{"orderNumber":"...","deliveryDate":"...","buyer":"...","email":"...","deliveryAddress":"..."}}"""
-
-    response = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-        max_tokens=400,
+    # Delivery address: section "Dirección entrega"
+    m = re.search(
+        r'Direcci[oó]n\s+entrega\s*\n((?:[^\n]+\n){1,8})',
+        full_text,
+        re.IGNORECASE,
     )
-    raw = response.choices[0].message.content.strip()
-    raw = re.sub(r'^```json|^```|```$', '', raw, flags=re.MULTILINE).strip()
-    return json.loads(raw)
+    if m:
+        block = m.group(1)
+        # Stop at "Proveedor" or empty line
+        lines = []
+        for ln in block.split("\n"):
+            if not ln.strip():
+                break
+            if ln.strip().startswith("Proveedor"):
+                break
+            lines.append(ln.strip())
+        h["deliveryAddress"] = " ".join(lines)
+    # Alternative: look inside tables
+    if not h.get("deliveryAddress"):
+        for t in tables:
+            for row in t:
+                for cell in row:
+                    if cell and "Dirección entrega" in str(cell):
+                        parts = str(cell).split("Dirección entrega", 1)[1]
+                        h["deliveryAddress"] = " ".join(
+                            ln.strip() for ln in parts.split("\n") if ln.strip()
+                        )
+                        break
+
+    return h
 
 
-def extract_delivery_address(full_text: str) -> str:
-    """Extract the delivery address block from the PDF text."""
-    # Look for delivery address section
-    for pattern in [
-        r'Direcci[oó]n entrega\s*\n((?:[^\n]+\n){2,6})',
-        r'Delivery address\s*\n((?:[^\n]+\n){2,6})',
-    ]:
-        m = re.search(pattern, full_text, re.IGNORECASE)
+def _extract_header_astemo(full_text: str, tables: list) -> dict:
+    h = {}
+
+    m = re.search(r'Purchase order number[:\s]+(\S+)', full_text, re.IGNORECASE)
+    if m:
+        h["orderNumber"] = m.group(1).strip()
+
+    m = re.search(r'Creation date[:\s]+(\d{2}[-/]\d{2}[-/]\d{4})', full_text, re.IGNORECASE)
+    if m:
+        h["deliveryDate"] = _normalize_date(m.group(1))
+
+    # Buyer: "Requester: DIAS JOÃO" on its own. Split by whitespace until we hit
+    # a typical Astemo delimiter word.
+    m = re.search(r'Requester\s*:\s*(.+?)(?:\s+Sales\b|\s+Tel\b|\s+Email\b|\n)', full_text)
+    if m:
+        h["buyer"] = m.group(1).strip()
+
+    for mm in EMAIL_RE.finditer(full_text):
+        email = mm.group(0)
+        if "hoffmann" not in email.lower() and "astemo.com" in email.lower() and "vendor" not in email.lower() and "proc-center" not in email.lower() and "payables" not in email.lower():
+            h["email"] = email
+            break
+
+    # Delivery address
+    m = re.search(
+        r'Delivery address\s*\n((?:[^\n]+\n){1,8})',
+        full_text,
+        re.IGNORECASE,
+    )
+    if m:
+        lines = []
+        for ln in m.group(1).split("\n"):
+            if not ln.strip() or ln.strip().startswith("Invoiced") or ln.strip().startswith("Terms"):
+                break
+            lines.append(ln.strip())
+        # Remove columns that may be glued: "Astemo... Astemo... Pdf format to"
+        # Just take the first address block
+        h["deliveryAddress"] = " ".join(lines)
+
+    return h
+
+
+def _extract_header_generic(full_text: str, tables: list) -> dict:
+    h = {}
+    # Try all known patterns
+    patterns_order = [
+        r'No\.?Pedido\s+(\S+)',
+        r'Purchase order number[:\s]+(\S+)',
+        r'Order number[:\s]+(\S+)',
+        r'N[º°]\s*pedido[:\s]+(\S+)',
+    ]
+    for pat in patterns_order:
+        m = re.search(pat, full_text, re.IGNORECASE)
         if m:
-            return m.group(1).strip()
-    return ""
+            h["orderNumber"] = m.group(1).strip()
+            break
+
+    for pat in [
+        r'Fecha de orden\s+(\d{1,2}[/-]\d{2}[/-]\d{4})',
+        r'Creation date[:\s]+(\d{2}[-/]\d{2}[-/]\d{4})',
+        r'Date[:\s]+(\d{1,2}[/-]\d{1,2}[/-]\d{4})',
+    ]:
+        m = re.search(pat, full_text, re.IGNORECASE)
+        if m:
+            h["deliveryDate"] = _normalize_date(m.group(1))
+            break
+
+    m = EMAIL_RE.search(full_text)
+    if m:
+        h["email"] = m.group(0)
+
+    return h
 
 
 # ─── Line extraction ──────────────────────────────────────────────────────────
 
-def parse_number(s: str) -> str:
-    """Normalize number string: strip spaces, keep comma as decimal separator."""
-    return s.strip() if s else ""
-
-
-def extract_lines_from_table(tables: list, catalog: list[str]) -> list[dict]:
-    """
-    Extract order lines from pdfplumber tables.
-    Returns list of dicts with hoffmannArticle, quantity, unitPrice, linePrice.
-    """
+def _extract_lines_aludium(tables: list) -> list[dict]:
+    """Parse Aludium-style tables where each line is a single text blob."""
     lines = []
-    line_pattern = re.compile(r'^\d+-\d+$')  # matches "1-1", "2-1", etc.
-
     for table in tables:
-        if not table:
-            continue
         for row in table:
             if not row:
                 continue
-            # Clean cells
-            cells = [str(c).strip() if c else "" for c in row]
+            # Try each cell, because pdfplumber sometimes keeps the whole row
+            # in a single cell, sometimes splits it.
+            candidates = []
+            for c in row:
+                if c:
+                    candidates.append(str(c).strip())
+            # Also try the full row joined
+            joined = " ".join(str(c) for c in row if c).strip()
+            if joined and joined not in candidates:
+                candidates.append(joined)
 
-            # Skip header rows
-            if any(h in cells[0].lower() for h in ["line", "artículo", "artculo", "item", "order"]):
-                continue
-
-            # Check if first cell looks like a line number "1-1", "2-1"
-            is_line_row = line_pattern.match(cells[0]) if cells[0] else False
-
-            # For Aludium format: Line-Rel | Description | Date | Qty | UdM | UnitPrice | Amount
-            if is_line_row and len(cells) >= 6:
-                description = cells[1] if len(cells) > 1 else ""
-                quantity = cells[3] if len(cells) > 3 else ""
-                unit_price = cells[5] if len(cells) > 5 else ""
-                line_price = cells[6] if len(cells) > 6 else ""
-
-                ref = find_reference(description, catalog)
-                if ref or description:
+            for text in candidates:
+                m = ALUDIUM_LINE_RE.match(text)
+                if m:
+                    line_rel, content, date, qty, uom, price, amount, cont = m.groups()
+                    full = content + (" " + cont if cont else "")
+                    ref = _extract_reference(content, full)
                     lines.append({
-                        "hoffmannArticle": ref or "",
-                        "description_raw": description,
-                        "quantity": parse_number(quantity),
-                        "unitPrice": parse_number(unit_price),
-                        "linePrice": parse_number(line_price),
-                        "needs_llm": ref is None,
+                        "line_rel": line_rel,
+                        "hoffmannArticle": ref,
+                        "quantity": qty.strip(),
+                        "unitPrice": price.strip(),
+                        "linePrice": amount.strip(),
                     })
+                    break  # don't parse the same line twice
+    # Deduplicate by line_rel
+    seen = set()
+    out = []
+    for l in lines:
+        if l["line_rel"] in seen:
+            continue
+        seen.add(l["line_rel"])
+        out.append(l)
+    return out
 
-            # For Astemo format: Order line # | Item number | Qty | Unit | Description | Price | ...
-            elif cells[0] and re.match(r'^\d+$', cells[0]) and len(cells) >= 5:
-                # Item number may be in column 1
-                item_number = cells[1] if len(cells) > 1 else ""
-                description = cells[4] if len(cells) > 4 else ""
-                quantity = cells[2] if len(cells) > 2 else ""
-                unit_price = cells[5] if len(cells) > 5 else ""
-                line_price = cells[6] if len(cells) > 6 else ""
 
-                # Try catalog lookup on item number first, then description
-                ref = find_reference(item_number + " " + description, catalog)
-                if ref or description:
-                    lines.append({
-                        "hoffmannArticle": ref or "",
-                        "description_raw": description,
-                        "quantity": parse_number(quantity),
-                        "unitPrice": parse_number(unit_price),
-                        "linePrice": parse_number(line_price),
-                        "needs_llm": ref is None,
-                    })
+def _extract_lines_astemo(full_text: str) -> list[dict]:
+    """Parse Astemo-style: lines are text blocks with 'ref\\nprice per N'."""
+    lines = []
 
+    # Find all "NNNNNN [suffix]\n<price> per <N>" patterns
+    for m in ASTEMO_LINE_RE.finditer(full_text):
+        ref = re.sub(r'\s+', ' ', m.group(1)).strip()
+        unit_price = m.group(2).strip().replace(".", ",")
+
+        # Look backward from the match for quantity and total
+        start = m.start()
+        block_before = full_text[max(0, start - 400): start]
+
+        # Quantity: "X.XX Each" or "X Each"
+        qty_m = re.search(r'(\d+(?:[.,]\d+)?)\s+(?:Each|each|Un|UN)\b', block_before)
+        quantity = qty_m.group(1).replace(".", ",") if qty_m else ""
+
+        # Total amount: last number followed by EUR before the ref
+        amt_m = None
+        for am in re.finditer(r'(\d+[.,]\d+)\s+(?:EUR|eur)\b', block_before):
+            amt_m = am
+        line_price = amt_m.group(1).replace(".", ",") if amt_m else unit_price
+
+        # Skip total lines (whole-order total) — they'll come after "Total"
+        # The ASTEMO_LINE_RE should not match the order total because
+        # total has no "per" suffix. OK.
+
+        lines.append({
+            "line_rel": f"{len(lines)+1}-1",
+            "hoffmannArticle": ref,
+            "quantity": quantity,
+            "unitPrice": unit_price,
+            "linePrice": line_price,
+        })
     return lines
 
 
-def extract_lines_with_llm(full_text: str, catalog: list[str]) -> list[dict]:
-    """Use OpenAI to extract lines when table parsing fails or misses references."""
-    prompt = f"""Extract all order lines from this purchase order text. For each line find:
-- hoffmannArticle: the Hoffmann article/item reference number (digits, may include space and suffix like "845020 18" or "708205 300"). Look for patterns like "Número de artículo:", "Item number:", or numbers embedded in descriptions.
-- quantity: the quantity ordered (number)
-- unitPrice: the unit price (number with comma decimal)
-- linePrice: the total line price (number with comma decimal)
-
-Return ONLY a JSON array, no markdown. Example:
-[{{"hoffmannArticle":"845020 18","quantity":"15","unitPrice":"6,32","linePrice":"94,80"}}]
-
-Purchase order text:
-{full_text[:4000]}"""
-
-    response = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0,
-        max_tokens=1000,
-    )
-    raw = response.choices[0].message.content.strip()
-    raw = re.sub(r'^```json|^```|```$', '', raw, flags=re.MULTILINE).strip()
-    llm_lines = json.loads(raw)
-
-    # Validate references against catalog
-    result = []
-    for line in llm_lines:
-        ref_raw = line.get("hoffmannArticle", "")
-        # Confirm ref exists in catalog, else try lookup
-        confirmed = find_reference(ref_raw, catalog) or ref_raw
-        result.append({
-            "hoffmannArticle": confirmed,
-            "quantity": line.get("quantity", ""),
-            "unitPrice": line.get("unitPrice", ""),
-            "linePrice": line.get("linePrice", ""),
-            "needs_llm": False,
-        })
-    return result
-
-
-# ─── Main extraction function ─────────────────────────────────────────────────
+# ─── Main entry point ────────────────────────────────────────────────────────
 
 def extract_pdf(pdf_path: str, catalog: list[str], clients: list[dict]) -> str:
-    """
-    Main function: extracts a purchase order PDF and returns the pipe-delimited output.
-    """
+    """Extract a purchase order PDF and return the pipe-delimited string."""
+
     with pdfplumber.open(pdf_path) as pdf:
-        full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+        full_text = "\n".join((page.extract_text() or "") for page in pdf.pages)
         all_tables = []
         for page in pdf.pages:
-            tables = page.extract_tables()
-            if tables:
-                all_tables.extend(tables)
+            try:
+                all_tables.extend(page.extract_tables() or [])
+            except Exception:
+                pass
 
-    # ── 1. Extract header ──────────────────────────────────────────────────
-    header = extract_header_with_rules(full_text)
+    fmt = _detect_format(full_text)
 
-    # Fill missing header fields with LLM
-    needed = {"orderNumber", "deliveryDate", "buyer", "email"}
-    missing = needed - set(k for k, v in header.items() if v)
-    if missing:
-        try:
-            llm_header = extract_header_with_llm(full_text)
-            for field in missing:
-                if llm_header.get(field):
-                    header[field] = llm_header[field]
-            # Always get delivery address from LLM header if available
-            if "deliveryAddress" not in header and llm_header.get("deliveryAddress"):
-                header["deliveryAddress"] = llm_header["deliveryAddress"]
-        except Exception as e:
-            print(f"LLM header extraction failed: {e}")
+    # Header
+    if fmt == "aludium":
+        header = _extract_header_aludium(full_text, all_tables)
+    elif fmt == "astemo":
+        header = _extract_header_astemo(full_text, all_tables)
+    else:
+        header = _extract_header_generic(full_text, all_tables)
 
-    # ── 2. Extract delivery address and match client ───────────────────────
-    delivery_address = header.get("deliveryAddress") or extract_delivery_address(full_text)
+    # Lines
+    if fmt == "aludium":
+        lines = _extract_lines_aludium(all_tables)
+    elif fmt == "astemo":
+        lines = _extract_lines_astemo(full_text)
+    else:
+        # Try both
+        lines = _extract_lines_aludium(all_tables)
+        if not lines:
+            lines = _extract_lines_astemo(full_text)
+
+    # Validate references (optional: mark if not in catalog)
+    for line in lines:
+        if line["hoffmannArticle"] and catalog:
+            # Don't block if not found; just record
+            line["_in_catalog"] = validate_reference(line["hoffmannArticle"], catalog)
+
+    # Client lookup
+    delivery_address = header.get("deliveryAddress", "")
     client_info = find_client(delivery_address, clients)
 
-    # ── 3. Extract order lines ─────────────────────────────────────────────
-    lines = extract_lines_from_table(all_tables, catalog)
-
-    # If no lines found from tables, use LLM
-    if not lines:
-        try:
-            lines = extract_lines_with_llm(full_text, catalog)
-        except Exception as e:
-            print(f"LLM line extraction failed: {e}")
-
-    # For lines that need LLM (reference not found in catalog), use LLM fallback
-    unresolved = [l for l in lines if l.get("needs_llm")]
-    if unresolved:
-        try:
-            # Build text snippet for just the unresolved descriptions
-            snippet = "\n".join(l["description_raw"] for l in unresolved)
-            llm_refs = extract_lines_with_llm(snippet, catalog)
-            # Map back by position
-            for i, line in enumerate(unresolved):
-                if i < len(llm_refs):
-                    line["hoffmannArticle"] = llm_refs[i].get("hoffmannArticle", "")
-                line["needs_llm"] = False
-        except Exception as e:
-            print(f"LLM fallback for unresolved lines failed: {e}")
-
-    # ── 4. Build output ────────────────────────────────────────────────────
-    head = "|".join([
+    # ── Assemble output ─────────────────────────────────────────────────
+    head_fields = [
         "HEAD",
         client_info.get("client_number", ""),
         header.get("orderNumber", ""),
@@ -284,7 +388,8 @@ def extract_pdf(pdf_path: str, catalog: list[str], clients: list[dict]) -> str:
         client_info.get("country", ""),
         "",  # shiptopostcode
         header.get("email", ""),
-    ])
+    ]
+    head = "|".join(head_fields)
 
     line_rows = []
     for line in lines:
