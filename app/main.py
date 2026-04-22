@@ -13,7 +13,6 @@ app = FastAPI(title="Hoffmann PDF Extractor", version="1.0.0")
 API_KEY = os.environ.get("API_KEY", "changeme")
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
 
-# Load catalog and clients at startup
 catalog = None
 clients = None
 
