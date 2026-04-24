@@ -112,10 +112,51 @@ def _validate_lines(lines: list[dict]) -> list[str]:
     for i, line in enumerate(lines, start=1):
         if not line.get("hoffmannArticle", "").strip():
             issues.append(f"Line {i}: missing Hoffmann reference")
-        if not line.get("quantity", "").strip():
+
+        qty_raw = line.get("quantity", "").strip()
+        unit_raw = line.get("unitPrice", "").strip()
+        total_raw = line.get("linePrice", "").strip()
+
+        qty_num = unit_num = total_num = None
+
+        # Parse quantity
+        if not qty_raw:
             issues.append(f"Line {i}: missing quantity")
-        if not line.get("unitPrice", "").strip():
+        else:
+            try:
+                qty_num = float(qty_raw.replace(",", "."))
+                if qty_num <= 0:
+                    issues.append(f"Line {i}: quantity must be greater than zero (got {qty_raw})")
+                    qty_num = None
+            except ValueError:
+                issues.append(f"Line {i}: quantity is not numeric (got {qty_raw})")
+
+        # Parse unit price
+        if not unit_raw:
             issues.append(f"Line {i}: missing unit price")
+        else:
+            try:
+                unit_num = float(unit_raw.replace(",", "."))
+            except ValueError:
+                issues.append(f"Line {i}: unit price is not numeric (got {unit_raw})")
+
+        # Parse line price (optional but used for cross-check)
+        if total_raw:
+            try:
+                total_num = float(total_raw.replace(",", "."))
+            except ValueError:
+                pass  # just skip the cross-check if it's not numeric
+
+        # Cross-check: linePrice / unitPrice should equal quantity (tolerance 1%)
+        if qty_num is not None and unit_num is not None and total_num is not None and unit_num > 0:
+            expected_qty = total_num / unit_num
+            # Tolerance: 1% of expected quantity OR 0.01 (whichever is larger)
+            tolerance = max(expected_qty * 0.01, 0.01)
+            if abs(qty_num - expected_qty) > tolerance:
+                issues.append(
+                    f"Line {i}: quantity mismatch — stated {qty_num}, but "
+                    f"linePrice/unitPrice = {total_num}/{unit_num} = {expected_qty:.4f}"
+                )
     return issues
 
 
