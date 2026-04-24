@@ -53,7 +53,29 @@ def health():
         "status": "ok",
         "catalog_size": len(catalog),
         "clients_size": len(clients),
+        "openai_configured": bool(os.environ.get("OPENAI_API_KEY")),
     }
+
+
+@app.get("/diag")
+def diagnostic(_: str = Security(verify_api_key)):
+    """Diagnostic endpoint to verify OpenAI connectivity. Requires API Key."""
+    result = {
+        "openai_key_set": bool(os.environ.get("OPENAI_API_KEY")),
+        "openai_key_prefix": (os.environ.get("OPENAI_API_KEY", "")[:10] + "...") if os.environ.get("OPENAI_API_KEY") else None,
+        "catalog_size": len(catalog),
+        "clients_size": len(clients),
+    }
+    if result["openai_key_set"]:
+        try:
+            from .llm import extract_with_llm
+            test = extract_with_llm("Test PDF: Purchase order number: TEST123\nDate: 01/01/2026\nBuyer: Test User")
+            result["openai_test"] = "ok"
+            result["openai_response"] = test
+        except Exception as e:
+            result["openai_test"] = "failed"
+            result["openai_error"] = f"{type(e).__name__}: {e}"
+    return result
 
 
 @app.post("/extract", response_class=PlainTextResponse)

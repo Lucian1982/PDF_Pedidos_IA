@@ -352,46 +352,59 @@ def extract_pdf(pdf_path: str, catalog: list[str], clients: list[dict]) -> str:
 
     fmt = _detect_format(full_text)
 
-    # ─── Rule-based extraction ──────────────────────────────────────────
+    # ─── Rule-based extraction (ONLY for known formats) ──────────────────
+    used_rules = False
     if fmt == "aludium":
         header = _extract_header_aludium(full_text, all_tables)
         lines = _extract_lines_aludium(all_tables)
+        used_rules = True
     elif fmt == "astemo":
         header = _extract_header_astemo(full_text, all_tables)
         lines = _extract_lines_astemo(full_text)
+        used_rules = True
     else:
-        header = _extract_header_generic(full_text, all_tables)
-        lines = _extract_lines_aludium(all_tables) or _extract_lines_astemo(full_text)
+        # For unknown formats: skip the unreliable generic rules
+        # and go straight to the LLM below
+        header = {}
+        lines = []
 
-    # ─── Quality check + LLM fallback ───────────────────────────────────
-    is_good, reason = _assess_quality(header, lines)
+    # ─── Quality check ───────────────────────────────────────────────────
+    is_good, reason = _assess_quality(header, lines) if used_rules else (False, "unknown format")
+    print(f"[extractor] format={fmt}, rules_used={used_rules}, quality_ok={is_good}, reason={reason}, lines={len(lines)}")
 
-    if not is_good and os.environ.get("OPENAI_API_KEY"):
-        print(f"[extractor] Rules not good enough ({reason}), trying LLM...")
-        try:
-            from .llm import extract_with_llm
-            llm_data = extract_with_llm(full_text)
+    # ─── LLM fallback (or main path for unknown formats) ─────────────────
+    if not is_good:
+        if not os.environ.get("OPENAI_API_KEY"):
+            print("[extractor] OPENAI_API_KEY not set — cannot fall back to LLM")
+        else:
+            print(f"[extractor] Calling OpenAI to extract this PDF...")
+            try:
+                from .llm import extract_with_llm
+                llm_data = extract_with_llm(full_text)
+                print(f"[extractor] LLM returned: orderNumber={llm_data.get('orderNumber')}, lines={len(llm_data.get('lines', []))}")
 
-            # Fill missing header fields from LLM
-            for field in ("orderNumber", "deliveryDate", "buyer", "email", "deliveryAddress"):
-                if not header.get(field) and llm_data.get(field):
-                    header[field] = llm_data[field]
+                # Fill missing header fields from LLM
+                for field in ("orderNumber", "deliveryDate", "buyer", "email", "deliveryAddress"):
+                    if not header.get(field) and llm_data.get(field):
+                        header[field] = llm_data[field]
 
-            llm_lines = [
-                {
-                    "line_rel": f"{i+1}-1",
-                    "hoffmannArticle": str(l.get("hoffmannArticle", "")).strip(),
-                    "quantity": _normalize_number(str(l.get("quantity", ""))),
-                    "unitPrice": _normalize_number(str(l.get("unitPrice", ""))),
-                    "linePrice": _normalize_number(str(l.get("linePrice", ""))),
-                }
-                for i, l in enumerate(llm_data.get("lines", []))
-            ]
-            # Use LLM lines if rules failed or LLM found more
-            if not lines or len(llm_lines) > len(lines):
-                lines = llm_lines
-        except Exception as e:
-            print(f"[extractor] LLM fallback failed: {e}")
+                llm_lines = [
+                    {
+                        "line_rel": f"{i+1}-1",
+                        "hoffmannArticle": str(l.get("hoffmannArticle", "")).strip(),
+                        "quantity": _normalize_number(str(l.get("quantity", ""))),
+                        "unitPrice": _normalize_number(str(l.get("unitPrice", ""))),
+                        "linePrice": _normalize_number(str(l.get("linePrice", ""))),
+                    }
+                    for i, l in enumerate(llm_data.get("lines", []))
+                ]
+                # Use LLM lines if rules failed or LLM found more
+                if not lines or len(llm_lines) > len(lines):
+                    lines = llm_lines
+            except Exception as e:
+                print(f"[extractor] LLM call failed: {type(e).__name__}: {e}")
+                import traceback
+                traceback.print_exc()
 
     # ─── Validate references against catalog ────────────────────────────
     for line in lines:

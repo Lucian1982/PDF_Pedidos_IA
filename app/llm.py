@@ -1,12 +1,11 @@
 """
-OpenAI fallback for PDFs where rule-based extraction is not good enough.
-Uses gpt-4o-mini with a structured JSON schema so the output is deterministic.
+OpenAI extractor for Hoffmann purchase orders.
+Uses gpt-4o-mini with structured JSON output.
 """
 
 from __future__ import annotations
 import os
 import json
-import re
 from openai import OpenAI
 
 _client: OpenAI | None = None
@@ -22,74 +21,76 @@ def _get_client() -> OpenAI:
     return _client
 
 
-PROMPT = """You extract purchase order data from a PDF's text. The PDFs are always for \
-a supplier called Hoffmann, but the buyer (customer) varies: each customer has its own \
-layout and language (Spanish, English, Portuguese, etc.).
+SYSTEM_PROMPT = (
+    "You are a precise data-extraction engine for purchase orders (POs). "
+    "The supplier is ALWAYS 'Hoffmann' (or Hoffmann Iberia / Hoffmann Group). "
+    "The buyer varies: hundreds of different customers, each with their own layout and language "
+    "(Spanish, English, Portuguese, Italian, French, etc.). "
+    "Your job is to pull the header fields and the line items of the PO. "
+    "Output valid JSON only. Never invent data. If a field is missing, return an empty string."
+)
 
-Return ONLY a JSON object, no markdown, no comments. Use this exact schema:
+USER_PROMPT = """Extract the purchase order data from the following PDF text.
+
+Return a JSON object with this exact shape:
 
 {
-  "orderNumber": "<purchase order number>",
-  "deliveryDate": "<creation/order date as DD/MM/YYYY>",
-  "buyer": "<full name of the person who placed the order>",
-  "email": "<email of the buyer, not a generic inbox>",
-  "deliveryAddress": "<full ship-to / delivery address as a single line>",
+  "orderNumber": "the PO number as it appears on the document",
+  "deliveryDate": "the creation/order date in DD/MM/YYYY format",
+  "buyer": "full name of the person who placed the order (NOT a department, NOT a generic title)",
+  "email": "email of the buyer. If only a generic inbox appears, use that. Skip emails of the supplier (hoffmann) and emails of the invoicing/payables department.",
+  "deliveryAddress": "full ship-to / delivery address as a single line, including street, postal code, city and country",
   "lines": [
     {
-      "hoffmannArticle": "<Hoffmann article number, digits, may include a space and a \
-suffix like '642229 8' or 'M12' or '1/2'>",
-      "quantity": "<numeric quantity, use comma as decimal separator if decimal>",
-      "unitPrice": "<unit price, comma as decimal separator>",
-      "linePrice": "<total for the line, comma as decimal separator>"
+      "hoffmannArticle": "the Hoffmann article number",
+      "quantity": "numeric quantity",
+      "unitPrice": "unit price",
+      "linePrice": "total amount for the line"
     }
   ]
 }
 
-Rules:
-- Hoffmann article numbers typically have 5-6 digits, sometimes followed by a \
-numeric or alphanumeric suffix (e.g. "759856 600", "640190 1/2", "082812 M12").
-- The Hoffmann article is usually embedded in the item description. It may appear at \
-the start (e.g. "759800 - PALANCA DE UÑA") or at the end (e.g. \
-"Número de artículo: 845020 18" or "HOFFMANN/HOLEX 708205 300").
-- If a customer reference is shown (e.g. an internal SAP code), DO NOT use it as \
-hoffmannArticle. Use ONLY the Hoffmann reference.
-- Use comma (,) as decimal separator for all numbers.
-- If a field is not present, use an empty string "".
-- Return every line item found, never skip any.
+CRITICAL RULES about the Hoffmann article number:
+- Hoffmann references typically have 5-6 digits, sometimes followed by a numeric or alphanumeric suffix separated by a space.
+  Examples: "759800", "759856 600", "640190 1/2", "082812 M12", "642229 8", "708205 300".
+- The Hoffmann reference is usually embedded inside the item description. It may appear:
+  * At the beginning: "759800 - PALANCA DE UÑA"
+  * At the end after a label: "Número de artículo: 845020 18" or "Part number: 708205 300"
+  * Mixed with a brand: "HOFFMANN/HOLEX 708205 300" or "HOLEX 759856 600"
+  * As "Your part number" or "Supplier part number" field
+- DO NOT use the customer's internal material code (e.g. Talgo "10078071", TE "576705W") as hoffmannArticle.
+- If you cannot find a clear Hoffmann reference in the line, return an empty string for that field.
 
-PDF text:
----
-{text}
----
+FORMATTING RULES:
+- Use comma (,) as decimal separator for all numbers (e.g. "12,65" not "12.65").
+- Return every line item, never skip one, even if some fields are empty.
+- Do not include any text outside the JSON object.
 
-JSON:"""
+PDF TEXT:
+---
+<<<PDF_TEXT>>>
+---
+"""
 
 
 def extract_with_llm(full_text: str, model: str = "gpt-4o-mini") -> dict:
-    """
-    Extract order data using OpenAI.
-    Returns a dict with orderNumber, deliveryDate, buyer, email, deliveryAddress, lines.
-    """
     client = _get_client()
-    # Truncate very long texts to stay within reasonable token limits
     text = full_text[:15000]
+    user = USER_PROMPT.replace("<<<PDF_TEXT>>>", text)
 
     response = client.chat.completions.create(
         model=model,
         messages=[
-            {"role": "system", "content": "You are a precise data extraction engine. Output only valid JSON."},
-            {"role": "user", "content": PROMPT.format(text=text)},
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user},
         ],
         temperature=0,
         response_format={"type": "json_object"},
     )
 
     raw = response.choices[0].message.content.strip()
-    # Remove possible markdown fences
-    raw = re.sub(r'^```(?:json)?|```$', '', raw, flags=re.MULTILINE).strip()
     data = json.loads(raw)
 
-    # Normalize: ensure all expected keys exist
     data.setdefault("orderNumber", "")
     data.setdefault("deliveryDate", "")
     data.setdefault("buyer", "")
@@ -97,7 +98,6 @@ def extract_with_llm(full_text: str, model: str = "gpt-4o-mini") -> dict:
     data.setdefault("deliveryAddress", "")
     data.setdefault("lines", [])
 
-    # Normalize line keys
     for line in data["lines"]:
         line.setdefault("hoffmannArticle", "")
         line.setdefault("quantity", "")
