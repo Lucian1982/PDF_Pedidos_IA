@@ -40,8 +40,8 @@ Return a JSON object with this EXACT shape:
   "buyer": "full name of the person who placed the order (not a department)",
   "email": "buyer's email. Skip supplier emails (hoffmann) and generic invoice/payables inboxes. If only a generic company inbox is available, use it.",
   "phone": "phone of the buyer or the requester",
-  "customerName": "full legal name of the buyer company (e.g. 'Patentes Talgo, S.L.U.', 'TE Connectivity Componentes Electromecanicos LDA')",
-  "deliveryAddress": "full ship-to / delivery address as a single line, including street, postal code, city and country",
+  "customerName": "full legal name of the buyer company (e.g. 'Patentes Talgo, S.L.U.', 'TE Connectivity Componentes Electromecanicos LDA', 'EFAPEL - Empresa Fabril de Produtos Eléctricos, S.A.')",
+  "deliveryAddress": "full SHIP-TO / DELIVERY address where the goods must be delivered, as a single line, including street, postal code, city and country. This is the BUYER's warehouse/plant address, NOT the supplier's (Hoffmann) address. Look for labels like 'Dirección de entrega', 'Delivery address', 'Endereço de entrega', 'Ship to', 'Lieferadresse', 'Descarga', 'Local de entrega', 'Delivery location', 'Entrega en', 'Local de descarga'. If the document shows a 'Descarga:' block with just a city/postal code/location, use THAT as the delivery address even if it is shorter than the billing or supplier address. NEVER use the address of HOFFMANN (the supplier), even if it appears at the top of the document.",
   "lines": [
     {
       "hoffmannArticle": "the Hoffmann article number (empty string if not present)",
