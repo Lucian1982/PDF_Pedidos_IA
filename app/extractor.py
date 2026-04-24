@@ -273,7 +273,7 @@ def _build_success_response(llm_data: dict, client_info: dict, po_date: str) -> 
         ])
         line_rows.append(row)
 
-    return head + "\r\n" + "\r\n".join(line_rows)
+    return head + "\r\n" + "\r\n".join(line_rows) + "\r\n"
 
 
 def _fill_missing_refs_from_catalog(lines: list[dict], catalog: list[dict],
