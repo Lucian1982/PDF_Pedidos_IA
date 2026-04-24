@@ -104,6 +104,62 @@ def _extract_raw_text(pdf_path: str) -> str:
         return "\n".join((page.extract_text() or "") for page in pdf.pages)
 
 
+def _auto_correct_quantities(lines: list[dict]) -> list[dict]:
+    """
+    For each line, if quantity is 0, empty, or doesn't match linePrice/unitPrice,
+    try to recompute it from the ratio. This fixes common LLM extraction errors
+    where the model picks the wrong number from a messy layout.
+    """
+    for i, line in enumerate(lines, start=1):
+        qty_raw = line.get("quantity", "").strip()
+        unit_raw = line.get("unitPrice", "").strip()
+        total_raw = line.get("linePrice", "").strip()
+
+        # Need both unit and total to compute the ratio
+        if not unit_raw or not total_raw:
+            continue
+        try:
+            unit_num = float(unit_raw.replace(",", "."))
+            total_num = float(total_raw.replace(",", "."))
+        except ValueError:
+            continue
+        if unit_num <= 0:
+            continue
+
+        computed_qty = total_num / unit_num
+
+        # Parse the quantity the LLM gave us
+        qty_num = None
+        if qty_raw:
+            try:
+                qty_num = float(qty_raw.replace(",", "."))
+            except ValueError:
+                qty_num = None
+
+        needs_fix = False
+        reason = ""
+        if qty_num is None or qty_num <= 0:
+            needs_fix = True
+            reason = f"LLM gave invalid quantity ({qty_raw!r})"
+        else:
+            # Does it match the ratio?
+            tolerance = max(computed_qty * 0.01, 0.01)
+            if abs(qty_num - computed_qty) > tolerance:
+                needs_fix = True
+                reason = f"LLM quantity {qty_num} doesn't match ratio {computed_qty:.4f}"
+
+        if needs_fix and computed_qty > 0:
+            # Format the computed quantity nicely: integer if whole, else 2 decimals with comma
+            if abs(computed_qty - round(computed_qty)) < 0.001:
+                corrected = str(int(round(computed_qty)))
+            else:
+                corrected = f"{computed_qty:.2f}".replace(".", ",")
+            print(f"[extractor] Auto-corrected Line {i} quantity: {qty_raw!r} → {corrected!r} ({reason})")
+            line["quantity"] = corrected
+            line["_qty_source"] = f"auto-corrected from linePrice/unitPrice"
+    return lines
+
+
 def _validate_lines(lines: list[dict]) -> list[str]:
     issues = []
     if not lines:
@@ -145,12 +201,11 @@ def _validate_lines(lines: list[dict]) -> list[str]:
             try:
                 total_num = float(total_raw.replace(",", "."))
             except ValueError:
-                pass  # just skip the cross-check if it's not numeric
+                pass
 
         # Cross-check: linePrice / unitPrice should equal quantity (tolerance 1%)
         if qty_num is not None and unit_num is not None and total_num is not None and unit_num > 0:
             expected_qty = total_num / unit_num
-            # Tolerance: 1% of expected quantity OR 0.01 (whichever is larger)
             tolerance = max(expected_qty * 0.01, 0.01)
             if abs(qty_num - expected_qty) > tolerance:
                 issues.append(
@@ -294,7 +349,11 @@ def extract_pdf(pdf_path: str, catalog: list[dict], clients: list[dict]) -> tupl
     lines = _fill_missing_refs_from_catalog(lines, catalog, min_confidence=90)
     llm_data["lines"] = lines
 
-    # ── 6. Validate ─────────────────────────────────────────────────────
+    # ── 6. Auto-correct quantities using linePrice / unitPrice ratio ────
+    lines = _auto_correct_quantities(lines)
+    llm_data["lines"] = lines
+
+    # ── 7. Validate ─────────────────────────────────────────────────────
     issues = []
     if not llm_data.get("orderNumber", "").strip():
         issues.append("Missing orderNumber")
