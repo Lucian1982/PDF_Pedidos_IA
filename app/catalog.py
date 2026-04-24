@@ -46,6 +46,37 @@ def load_catalog(path: str) -> list[dict]:
     return out
 
 
+def build_ref_index(catalog: list[dict]) -> dict:
+    """
+    Build a fast lookup set from normalized ref (no spaces) to the actual ref.
+    Useful to resolve customer part numbers like '724201125' → '724201 125'.
+    """
+    index = {}
+    for entry in catalog:
+        ref = entry["ref"]
+        normalized = ref.replace(" ", "")
+        # Only keep the first one seen (catalog is sorted longest first)
+        index.setdefault(normalized, ref)
+    return index
+
+
+def resolve_customer_part_number(customer_pn: str, ref_index: dict) -> str:
+    """
+    Try to resolve a customer part number (which may be missing the space
+    that separates base and suffix) to a real Hoffmann reference by checking
+    the no-space normalized index.
+
+    Example: '724201125' → '724201 125' if '724201 125' exists in the catalog.
+    """
+    if not customer_pn or not ref_index:
+        return ""
+    # Normalize: strip spaces
+    key = customer_pn.replace(" ", "").strip()
+    if not key:
+        return ""
+    return ref_index.get(key, "")
+
+
 def validate_reference(ref: str, catalog: list[dict]) -> bool:
     if not catalog:
         return True

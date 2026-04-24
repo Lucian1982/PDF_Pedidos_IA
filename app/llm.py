@@ -45,8 +45,9 @@ Return a JSON object with this EXACT shape:
   "lines": [
     {
       "hoffmannArticle": "the Hoffmann article number (empty string if not present)",
+      "customerPartNumber": "the customer's own part/reference number for this item, as shown on the document. Look for labels like 'Your part number', 'Your reference', 'Customer part number', 'Your PN', 'Nº material', 'Material', 'Código'. Return the value exactly as it appears, including any trailing letters or special characters. Empty string if not present.",
       "description": "the FULL item description as it appears in the PDF (e.g. 'PALANCA DE UÑA', 'Cepillo fino Alambre de latón ondulado', 'BOQUILLA AIRMIX PORTAINSERTO INOX'). Include brand and size/variant when present.",
-      "quantity": "numeric quantity",
+      "quantity": "numeric quantity - the number of units ordered. NEVER zero.",
       "unitPrice": "unit price",
       "linePrice": "total amount for the line"
     }
@@ -60,8 +61,17 @@ CRITICAL RULES about hoffmannArticle:
   * At the beginning: "759800 - PALANCA DE UÑA"
   * At the end after a label: "Número de artículo: 845020 18", "Part number: 708205 300"
   * Mixed with the brand: "HOFFMANN/HOLEX 708205 300", "HOLEX 759856 600"
-- DO NOT use the customer's internal material code as hoffmannArticle (e.g. Talgo "10078071", TE "576705W" unless it clearly matches the Hoffmann pattern).
-- If you cannot find a clear Hoffmann reference in a line, return "" (empty string). The description will be used later to look it up.
+- DO NOT use the customer's INTERNAL reference as hoffmannArticle. These are labelled with phrases like:
+  * "Your part number", "Your reference", "Customer part number", "Your PN"
+  * "Material", "Nº de material", "Código interno"
+  * Customer codes that don't look like Hoffmann (e.g. Talgo "10078071", TE "576705W", "576705 W")
+- If the line text only shows a customer part number (like "Your part number: 576705W") and NO Hoffmann reference, return "" (empty string) for hoffmannArticle. The description will be used later to look up the Hoffmann reference from the catalog.
+
+CRITICAL RULES about quantity:
+- The quantity is the NUMBER OF UNITS ORDERED. It is ALWAYS greater than zero.
+- If the line shows two numbers like "0 5 PC" or "0 5 UN", the quantity is 5 (the non-zero one). The 0 is a column artifact, position number, or placeholder — NEVER the quantity.
+- If the line shows "5 PC", "3 UN", "2,00 Each", "1.00 UN", the number right before the unit (PC, UN, Each, pcs) is the quantity.
+- If you cannot confidently determine a positive quantity, return "" (empty string), never "0".
 
 FORMATTING RULES:
 - Use comma (,) as decimal separator for ALL numbers (e.g. "12,65" not "12.65"). Convert dots to commas.
@@ -102,6 +112,7 @@ def extract_with_llm(full_text: str, model: str = "gpt-4o-mini") -> dict:
 
     for line in data["lines"]:
         line.setdefault("hoffmannArticle", "")
+        line.setdefault("customerPartNumber", "")
         line.setdefault("description", "")
         line.setdefault("quantity", "")
         line.setdefault("unitPrice", "")

@@ -19,7 +19,7 @@ import pdfplumber
 
 from .llm import extract_with_llm
 from .clients import find_client
-from .catalog import find_reference_by_name
+from .catalog import find_reference_by_name, build_ref_index, resolve_customer_part_number
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -277,17 +277,33 @@ def _build_success_response(llm_data: dict, client_info: dict, po_date: str) -> 
 
 
 def _fill_missing_refs_from_catalog(lines: list[dict], catalog: list[dict],
-                                    min_confidence: int = 90) -> list[dict]:
-    """For every line without a Hoffmann reference, try to find it by fuzzy-matching
-    the description against the catalog's product names. Only accept matches above
-    the confidence threshold."""
+                                    min_confidence: int = 80) -> list[dict]:
+    """For every line without a Hoffmann reference, try to resolve it using:
+    1. The customer part number (normalized, space-insensitive lookup in catalog).
+       Example: '724201125' → '724201 125' if that ref exists.
+    2. Fuzzy match of the description against catalog product names (>= min_confidence).
+    """
     if not catalog:
         return lines
+
+    ref_index = build_ref_index(catalog)
 
     for line in lines:
         ref = str(line.get("hoffmannArticle", "")).strip()
         if ref:
-            continue  # already has a reference
+            continue
+
+        # Step 1: Try resolving from customerPartNumber
+        cpn = str(line.get("customerPartNumber", "")).strip()
+        if cpn:
+            resolved = resolve_customer_part_number(cpn, ref_index)
+            if resolved:
+                line["hoffmannArticle"] = resolved
+                line["_ref_source"] = f"customer-part-match ('{cpn}' → '{resolved}')"
+                print(f"[extractor] Resolved customer part number: '{cpn}' → '{resolved}'")
+                continue
+
+        # Step 2: Fuzzy match by description
         desc = str(line.get("description", "")).strip()
         if not desc:
             continue
@@ -346,7 +362,7 @@ def extract_pdf(pdf_path: str, catalog: list[dict], clients: list[dict]) -> tupl
 
     # ── 5. Fill missing references via catalog name match ───────────────
     lines = llm_data.get("lines", [])
-    lines = _fill_missing_refs_from_catalog(lines, catalog, min_confidence=90)
+    lines = _fill_missing_refs_from_catalog(lines, catalog, min_confidence=80)
     llm_data["lines"] = lines
 
     # ── 6. Auto-correct quantities using linePrice / unitPrice ratio ────
