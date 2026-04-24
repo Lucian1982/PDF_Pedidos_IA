@@ -347,7 +347,7 @@ def extract_pdf(pdf_path: str, catalog: list[dict], clients: list[dict]) -> tupl
               f"lines={len(llm_data.get('lines', []))}")
     except Exception as e:
         print(f"[extractor] LLM call failed: {type(e).__name__}: {e}")
-        client_info = find_client(raw_text[:2000], clients)
+        client_info = find_client("", "", clients, raw_text_fallback=raw_text)
         return False, _build_error_response(
             f"OpenAI extraction failed: {type(e).__name__}: {e}",
             None, raw_text, client_info, "",
@@ -356,9 +356,10 @@ def extract_pdf(pdf_path: str, catalog: list[dict], clients: list[dict]) -> tupl
     # ── 3. Normalize the PO date to DD/MM/YYYY ──────────────────────────
     po_date = _normalize_date(llm_data.get("poDate", ""))
 
-    # ── 4. Client lookup ────────────────────────────────────────────────
-    delivery_address = llm_data.get("deliveryAddress", "") or raw_text[:2000]
-    client_info = find_client(delivery_address, clients)
+    # ── 4. Client lookup by VAT ─────────────────────────────────────────
+    customer_vat = llm_data.get("customerVat", "")
+    delivery_address = llm_data.get("deliveryAddress", "")
+    client_info = find_client(customer_vat, delivery_address, clients, raw_text_fallback=raw_text)
 
     # ── 5. Fill missing references via catalog name match ───────────────
     lines = llm_data.get("lines", [])
@@ -371,6 +372,10 @@ def extract_pdf(pdf_path: str, catalog: list[dict], clients: list[dict]) -> tupl
 
     # ── 7. Validate ─────────────────────────────────────────────────────
     issues = []
+    # ── 7. Validate ─────────────────────────────────────────────────────
+    issues = []
+    if client_info.get("error"):
+        issues.append(f"Client lookup failed: {client_info['error']}")
     if not llm_data.get("orderNumber", "").strip():
         issues.append("Missing orderNumber")
     issues.extend(_validate_lines(lines))
@@ -381,3 +386,219 @@ def extract_pdf(pdf_path: str, catalog: list[dict], clients: list[dict]) -> tupl
         )
 
     return True, _build_success_response(llm_data, client_info, po_date)
+
+
+# ─── Multi-PDF combined extraction ────────────────────────────────────────────
+
+def _enrich_missing_refs_with_llm(lines: list[dict], supplementary_text: str) -> list[dict]:
+    """
+    For each line still missing hoffmannArticle, ask the LLM to search for it
+    inside the text of the supplementary PDFs. Uses a single LLM call.
+    """
+    missing = [l for l in lines if not str(l.get("hoffmannArticle", "")).strip()]
+    if not missing or not supplementary_text.strip():
+        return lines
+
+    # Build a list of descriptions to find
+    items_to_find = "\n".join(
+        f'- "{l.get("description", "").strip()}"' + (f' (customer part: {l["customerPartNumber"]})' if l.get("customerPartNumber") else "")
+        for l in missing
+    )
+
+    prompt = f"""You have the text of one or more supplementary purchase-order documents. \
+These documents may contain additional information about the items in a main purchase order, \
+such as clarifications, an offer/quote that lists the Hoffmann article numbers, or a cross-reference table.
+
+Your task: for each item below, look in the supplementary text and find the Hoffmann article number (5-6 digits, \
+optionally followed by a space and a suffix like "759856 600" or "082812 M12" or "640190 1/2"). \
+If you cannot find a clear Hoffmann reference for an item, return an empty string for it.
+
+ITEMS TO RESOLVE:
+{items_to_find}
+
+Return ONLY a JSON object with this shape:
+{{
+  "matches": [
+    {{"description": "exact description from the list above", "hoffmannArticle": "reference or empty string"}}
+  ]
+}}
+
+SUPPLEMENTARY TEXT:
+---
+{supplementary_text[:10000]}
+---"""
+
+    try:
+        from .llm import _get_client
+        import json
+        client = _get_client()
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You find Hoffmann article references in supplementary purchase-order documents. Output only valid JSON."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(response.choices[0].message.content.strip())
+        matches = data.get("matches", [])
+
+        # Build a lookup by description
+        found_map = {m.get("description", "").strip(): m.get("hoffmannArticle", "").strip()
+                     for m in matches if m.get("hoffmannArticle")}
+
+        for line in lines:
+            if str(line.get("hoffmannArticle", "")).strip():
+                continue
+            desc = str(line.get("description", "")).strip()
+            if desc in found_map and found_map[desc]:
+                line["hoffmannArticle"] = found_map[desc]
+                line["_ref_source"] = "supplementary-pdf"
+                print(f"[extractor] Enriched from supplementary: '{desc[:50]}...' → {found_map[desc]}")
+    except Exception as e:
+        print(f"[extractor] Supplementary enrichment failed: {type(e).__name__}: {e}")
+
+    return lines
+
+
+def extract_pdfs_combined(pdf_paths: list[str], catalog: list[dict],
+                          clients: list[dict]) -> tuple[bool, object]:
+    """
+    Process several PDFs that belong to the SAME purchase order.
+    Selects a main PDF (the one with orderNumber + priced lines) and uses the
+    others as supplementary sources to enrich missing references.
+    """
+    if not pdf_paths:
+        return False, _build_error_response(
+            "No PDFs received", None, "", {"client_number": "", "country": "", "address": ""}, "",
+        )
+
+    # 1. Extract raw text and LLM data for every PDF
+    pdf_infos = []
+    for path in pdf_paths:
+        try:
+            raw_text = _extract_raw_text(path)
+        except Exception as e:
+            print(f"[extractor] Could not read {path}: {e}")
+            continue
+
+        try:
+            llm_data = extract_with_llm(raw_text)
+        except Exception as e:
+            print(f"[extractor] LLM failed on {path}: {type(e).__name__}: {e}")
+            llm_data = None
+
+        pdf_infos.append({
+            "path": path,
+            "raw_text": raw_text,
+            "llm_data": llm_data,
+        })
+
+    if not pdf_infos:
+        return False, _build_error_response(
+            "Could not read any of the submitted PDFs", None, "",
+            {"client_number": "", "country": "", "address": ""}, "",
+        )
+
+    # 2. Identify candidates: PDFs with orderNumber AND at least one priced line
+    def _has_po_content(info):
+        d = info.get("llm_data") or {}
+        if not d.get("orderNumber", "").strip():
+            return False
+        for line in d.get("lines", []):
+            if line.get("quantity", "").strip() and line.get("unitPrice", "").strip():
+                return True
+        return False
+
+    candidates = [i for i in pdf_infos if _has_po_content(i)]
+
+    if not candidates:
+        # No PDF has a recognizable PO → error
+        combined_raw = "\n\n---NEXT PDF---\n\n".join(i["raw_text"] for i in pdf_infos)
+        first_llm = next((i["llm_data"] for i in pdf_infos if i.get("llm_data")), None)
+        client_info = find_client(
+            (first_llm or {}).get("customerVat", ""),
+            (first_llm or {}).get("deliveryAddress", ""),
+            clients,
+            raw_text_fallback=combined_raw,
+        )
+        return False, _build_error_response(
+            "No PO could be identified in any of the submitted PDFs",
+            first_llm, combined_raw, client_info, "",
+        )
+
+    # 3. If several candidates with DIFFERENT orderNumber → error
+    order_numbers = {c["llm_data"]["orderNumber"].strip() for c in candidates}
+    if len(order_numbers) > 1:
+        combined_raw = "\n\n---NEXT PDF---\n\n".join(i["raw_text"] for i in pdf_infos)
+        client_info = find_client(
+            candidates[0]["llm_data"].get("customerVat", ""),
+            candidates[0]["llm_data"].get("deliveryAddress", ""),
+            clients,
+            raw_text_fallback=combined_raw,
+        )
+        return False, _build_error_response(
+            f"Multiple different purchase orders in one email: {sorted(order_numbers)}. Please split them.",
+            candidates[0]["llm_data"], combined_raw, client_info, "",
+        )
+
+    # 4. Main PDF = the candidate with the most priced lines (tiebreaker: first)
+    main = max(
+        candidates,
+        key=lambda i: sum(
+            1 for l in i["llm_data"].get("lines", [])
+            if l.get("quantity") and l.get("unitPrice")
+        ),
+    )
+    supplementary = [i for i in pdf_infos if i is not main]
+
+    main_llm = main["llm_data"]
+    main_text = main["raw_text"]
+    print(f"[extractor] Main PDF: orderNumber={main_llm.get('orderNumber')}, "
+          f"lines={len(main_llm.get('lines', []))}, "
+          f"supplementary={len(supplementary)}")
+
+    # 5. Normalize date
+    po_date = _normalize_date(main_llm.get("poDate", ""))
+
+    # 6. Client lookup by VAT
+    customer_vat = main_llm.get("customerVat", "")
+    delivery_address = main_llm.get("deliveryAddress", "")
+    client_info = find_client(customer_vat, delivery_address, clients, raw_text_fallback=main_text)
+
+    # 7. Fill missing refs from catalog (customer part number + name fuzzy match)
+    lines = main_llm.get("lines", [])
+    lines = _fill_missing_refs_from_catalog(lines, catalog, min_confidence=80)
+    main_llm["lines"] = lines
+
+    # 8. Enrich STILL missing refs using supplementary PDFs
+    if supplementary and any(not l.get("hoffmannArticle", "").strip() for l in lines):
+        supp_text = "\n\n---NEXT SUPPLEMENTARY PDF---\n\n".join(
+            s["raw_text"] for s in supplementary
+        )
+        lines = _enrich_missing_refs_with_llm(lines, supp_text)
+        # After enrichment, try catalog lookup again in case the LLM returned a
+        # customer-style code that needs space insertion
+        lines = _fill_missing_refs_from_catalog(lines, catalog, min_confidence=80)
+        main_llm["lines"] = lines
+
+    # 9. Auto-correct quantities
+    lines = _auto_correct_quantities(lines)
+    main_llm["lines"] = lines
+
+    # 10. Validate
+    issues = []
+    if client_info.get("error"):
+        issues.append(f"Client lookup failed: {client_info['error']}")
+    if not main_llm.get("orderNumber", "").strip():
+        issues.append("Missing orderNumber")
+    issues.extend(_validate_lines(lines))
+
+    if issues:
+        combined_raw = main_text + "\n\n---\n\n" + "\n\n".join(s["raw_text"] for s in supplementary)
+        return False, _build_error_response(
+            "; ".join(issues), main_llm, combined_raw, client_info, po_date,
+        )
+
+    return True, _build_success_response(main_llm, client_info, po_date)

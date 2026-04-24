@@ -41,7 +41,8 @@ Return a JSON object with this EXACT shape:
   "email": "buyer's email. Skip supplier emails (hoffmann) and generic invoice/payables inboxes. If only a generic company inbox is available, use it.",
   "phone": "phone of the buyer or the requester",
   "customerName": "full legal name of the buyer company (e.g. 'Patentes Talgo, S.L.U.', 'TE Connectivity Componentes Electromecanicos LDA', 'EFAPEL - Empresa Fabril de Produtos Eléctricos, S.A.')",
-  "deliveryAddress": "full SHIP-TO / DELIVERY address where the goods must be delivered, as a single line, including street, postal code, city and country. This is the BUYER's warehouse/plant address, NOT the supplier's (Hoffmann) address. Look for labels like 'Dirección de entrega', 'Delivery address', 'Endereço de entrega', 'Ship to', 'Lieferadresse', 'Descarga', 'Local de entrega', 'Delivery location', 'Entrega en', 'Local de descarga'. If the document shows a 'Descarga:' block with just a city/postal code/location, use THAT as the delivery address even if it is shorter than the billing or supplier address. NEVER use the address of HOFFMANN (the supplier), even if it appears at the top of the document.",
+  "customerVat": "the VAT/NIF/CIF/Tax ID of the CUSTOMER (the buyer company), never of Hoffmann. Look for labels like 'VAT', 'NIF', 'CIF', 'Tax ID', 'Tax number', 'C.I.F.', 'VAT/NIF'. Include the country prefix if present (e.g. 'PT501486429', 'ESB84528553', '500829136'). NEVER use Hoffmann's VAT numbers: 'B85500882', 'ESB85500882', 'B83727255', 'ESB83727255', 'PT980671566', '980671566'. If multiple VATs are present in the document, pick the one belonging to the buyer (the party receiving the goods), NOT Hoffmann.",
+  "deliveryAddress": "full SHIP-TO / DELIVERY address where the goods must be delivered, as a single line, including street, postal code, city and country. This is the BUYER's warehouse/plant address, NOT the supplier's (Hoffmann) address and NOT the buyer's billing/invoice address. Look for labels like 'Dirección de entrega', 'Dirección de envío', 'Delivery address', 'Ship to', 'Endereço de entrega', 'Local de entrega', 'Local de descarga', 'Descarga', 'Adresse de livraison', 'Lieu de livraison', 'Lieferadresse'. If the document shows a 'Descarga:' block with just a city/postal code/location, use THAT as the delivery address even if it is shorter than the billing or supplier address. NEVER use the billing address of the customer (labels like 'Dirección de facturación', 'Invoice address', 'Endereço da Fatura', 'Adresse de facturation') and NEVER use the address of HOFFMANN (the supplier).",
   "lines": [
     {
       "hoffmannArticle": "the Hoffmann article number (empty string if not present)",
@@ -106,7 +107,7 @@ def extract_with_llm(full_text: str, model: str = "gpt-4o-mini") -> dict:
 
     # Default every expected field
     for f in ("orderNumber", "poDate", "buyer", "email", "phone",
-              "customerName", "deliveryAddress"):
+              "customerName", "customerVat", "deliveryAddress"):
         data.setdefault(f, "")
     data.setdefault("lines", [])
 
