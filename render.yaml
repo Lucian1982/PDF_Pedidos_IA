@@ -17,3 +17,5 @@ services:
         value: data/catalog.xlsx
       - key: CLIENTS_PATH
         value: data/clients.xlsx
+      - key: CUSTOMER_CODES_PATH
+        value: data/codigos_referencias_clientes.xlsx
