@@ -278,7 +278,8 @@ def _build_success_response(llm_data: dict, client_info: dict, po_date: str) -> 
 
 def _fill_missing_refs_from_catalog(lines: list[dict], catalog: list[dict],
                                     min_confidence: int = 80) -> list[dict]:
-    """For every line without a Hoffmann reference, try to resolve it using:
+    """For every line, ensure the Hoffmann reference EXISTS in the catalog.
+    If not, blank it and try to resolve via:
     1. The customer part number (normalized, space-insensitive lookup in catalog).
        Example: '724201125' → '724201 125' if that ref exists.
     2. Fuzzy match of the description against catalog product names (>= min_confidence).
@@ -287,9 +288,28 @@ def _fill_missing_refs_from_catalog(lines: list[dict], catalog: list[dict],
         return lines
 
     ref_index = build_ref_index(catalog)
+    catalog_refs = {c["ref"] for c in catalog}
 
     for line in lines:
         ref = str(line.get("hoffmannArticle", "")).strip()
+
+        # ── VALIDATION: if LLM gave a ref, check it exists in the catalog ──
+        if ref and ref not in catalog_refs:
+            # Maybe the LLM put the ref without the space (e.g. '6260899' instead of '626089 9')
+            normalized = ref.replace(" ", "")
+            resolved = ref_index.get(normalized, "")
+            if resolved:
+                line["hoffmannArticle"] = resolved
+                line["_ref_source"] = f"normalized ('{ref}' → '{resolved}')"
+                print(f"[extractor] Normalized LLM ref: '{ref}' → '{resolved}'")
+                continue
+            else:
+                print(f"[extractor] LLM ref '{ref}' NOT in catalog → discarding and retrying")
+                line["hoffmannArticle"] = ""
+                line["_ref_source"] = f"LLM ref '{ref}' not in catalog (discarded)"
+                ref = ""
+
+        # If we already have a valid ref, skip
         if ref:
             continue
 
