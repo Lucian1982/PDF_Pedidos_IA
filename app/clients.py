@@ -44,8 +44,8 @@ def load_clients(path: str) -> list[dict]:
             col_map["number"] = c
         elif cl in ("pais", "país") or cl.startswith("pais") or cl.startswith("país"):
             col_map["country"] = c
-        elif "codigos" in cl and "propr" in cl:
-            col_map["own_codes"] = c
+        elif "codigos" in cl and "propios" in cl:
+            col_map["own_codes_flag"] = c
 
     clients = []
     for _, row in df.iterrows():
@@ -54,7 +54,9 @@ def load_clients(path: str) -> list[dict]:
         addr = str(row.get(col_map.get("address", ""), "")).strip()
         num = str(row.get(col_map.get("number", ""), "")).strip()
         country = str(row.get(col_map.get("country", ""), "")).strip().upper()
-        own_codes = str(row.get(col_map.get("own_codes", ""), "")).strip() if col_map.get("own_codes") else ""
+        own_codes_raw = str(row.get(col_map.get("own_codes_flag", ""), "")).strip().upper() if col_map.get("own_codes_flag") else ""
+        # "Codigos Propios" is True when the cell contains 'SI', 'YES', 'TRUE', '1'
+        has_own_codes = own_codes_raw in ("SI", "SÍ", "YES", "TRUE", "1", "X")
 
         if not vat or not num:
             continue
@@ -65,7 +67,7 @@ def load_clients(path: str) -> list[dict]:
             "address": addr,
             "client_number": num,
             "country": country,
-            "own_codes": own_codes,
+            "has_own_codes": has_own_codes,
         })
     return clients
 

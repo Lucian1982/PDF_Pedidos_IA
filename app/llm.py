@@ -1,6 +1,8 @@
 """
 OpenAI-based extraction for Hoffmann purchase orders.
 Uses gpt-4o-mini with structured JSON output. Always, for all PDFs.
+
+Also classifies the document type so non-orders are detected and skipped.
 """
 
 from __future__ import annotations
@@ -26,34 +28,55 @@ SYSTEM_PROMPT = (
     "The supplier is ALWAYS 'Hoffmann' (or Hoffmann Iberia / Hoffmann Group). "
     "The buyer is a customer company; every customer has its own layout and language "
     "(Spanish, English, Portuguese, Italian, French, German, etc.). "
-    "Your job is to extract the header fields, company/contact info, and line items. "
+    "Your job is to FIRST classify the document type and THEN, only if it is an order, "
+    "extract the header fields, company/contact info, and line items. "
     "Output valid JSON only. Never invent data. If a field is missing, return an empty string."
 )
 
-USER_PROMPT = """Extract the purchase order data from the following PDF text.
+USER_PROMPT = """Analyze the following PDF text. First decide what KIND of document this is, then extract data accordingly.
 
 Return a JSON object with this EXACT shape:
 
 {
-  "orderNumber": "PO number as shown on the document",
+  "documentType": "order" or "other",
+  "orderNumber": "PO number as shown on the document (only if documentType is 'order')",
   "poDate": "the DATE WHEN THE PO WAS CREATED/ISSUED (not delivery date, not 'date received', not item-level dates). Typical labels: 'Fecha de orden', 'Data da Ordem', 'Creation date', 'Document date', 'Order date', 'Fecha del pedido', 'Número del plan de entregas/Fecha'. Return it in DD/MM/YYYY format. Convert any format ('23-04-2026', '23-Abr-2026', '2026-04-23', 'April 23, 2026', '16.07.2024') into DD/MM/YYYY.",
   "buyer": "full name of the person who placed the order (not a department)",
   "email": "buyer's email. Skip supplier emails (hoffmann) and generic invoice/payables inboxes. If only a generic company inbox is available, use it.",
   "phone": "phone of the buyer or the requester",
   "customerName": "full legal name of the buyer company (e.g. 'Patentes Talgo, S.L.U.', 'TE Connectivity Componentes Electromecanicos LDA', 'EFAPEL - Empresa Fabril de Produtos Eléctricos, S.A.')",
-  "customerVat": "the VAT/NIF/CIF/Tax ID of the CUSTOMER (the buyer company), never of Hoffmann. Look for labels like 'VAT', 'NIF', 'CIF', 'Tax ID', 'Tax number', 'C.I.F.', 'VAT/NIF'. Include the country prefix if present (e.g. 'PT501486429', 'ESB84528553', '500829136'). NEVER use Hoffmann's VAT numbers: 'B85500882', 'ESB85500882', 'B83727255', 'ESB83727255', 'PT980671566', '980671566'. If multiple VATs are present in the document, pick the one belonging to the buyer (the party receiving the goods), NOT Hoffmann.",
-  "deliveryAddress": "full SHIP-TO / DELIVERY address where the goods must be delivered, as a single line, including street, postal code, city and country. This is the BUYER's warehouse/plant address, NOT the supplier's (Hoffmann) address and NOT the buyer's billing/invoice address. Look for labels like 'Dirección de entrega', 'Dirección de envío', 'Delivery address', 'Ship to', 'Endereço de entrega', 'Local de entrega', 'Local de descarga', 'Descarga', 'Adresse de livraison', 'Lieu de livraison', 'Lieferadresse'. If the document shows a 'Descarga:' block with just a city/postal code/location, use THAT as the delivery address even if it is shorter than the billing or supplier address. NEVER use the billing address of the customer (labels like 'Dirección de facturación', 'Invoice address', 'Endereço da Fatura', 'Adresse de facturation') and NEVER use the address of HOFFMANN (the supplier).",
+  "customerVat": "the VAT/NIF/CIF/Tax ID of the CUSTOMER (the buyer company), never of Hoffmann. Look for labels like 'VAT', 'NIF', 'CIF', 'Tax ID', 'Tax number', 'C.I.F.', 'VAT/NIF'. Include the country prefix if present (e.g. 'PT501486429', 'ESB84528553', '500829136'). NEVER use Hoffmann's VAT numbers: 'B85500882', 'ESB85500882', 'PT980671566', '980671566'. If multiple VATs are present in the document, pick the one belonging to the buyer (the party receiving the goods), NOT Hoffmann.",
+  "deliveryAddress": "full SHIP-TO / DELIVERY address where the goods must be delivered, as a single line, including street, postal code, city and country. This is the BUYER's warehouse/plant address, NOT the supplier's (Hoffmann) address and NOT the buyer's billing/invoice address. Look for labels like 'Dirección de entrega', 'Dirección de envío', 'Delivery address', 'Ship to', 'Endereço de entrega', 'Local de entrega', 'Local de descarga', 'Descarga', 'Entrega em', 'Adresse de livraison', 'Lieu de livraison', 'Lieferadresse'. If the document shows a 'Descarga:' or 'Entrega em:' block with just a city/postal code/location, use THAT as the delivery address even if it is shorter than the billing or supplier address. NEVER use the billing address of the customer (labels like 'Dirección de facturación', 'Invoice address', 'Endereço da Fatura', 'Adresse de facturation') and NEVER use the address of HOFFMANN (the supplier).",
   "lines": [
     {
       "hoffmannArticle": "the Hoffmann article number (empty string if not present)",
-      "customerPartNumber": "the customer's own part/reference number for this item, as shown on the document. Look for labels like 'Your part number', 'Your reference', 'Customer part number', 'Your PN', 'Nº material', 'Material', 'Código'. Return the value exactly as it appears, including any trailing letters or special characters. Empty string if not present.",
-      "description": "the FULL item description as it appears in the PDF (e.g. 'PALANCA DE UÑA', 'Cepillo fino Alambre de latón ondulado', 'BOQUILLA AIRMIX PORTAINSERTO INOX'). Include brand and size/variant when present.",
+      "customerPartNumber": "the customer's own part/reference number for this item, as shown on the document. Look for labels like 'Your part number', 'Your reference', 'Customer part number', 'Your PN', 'Nº material', 'Material', 'Código', 'Item number'. Return the value exactly as it appears, including any trailing letters or special characters. Empty string if not present.",
+      "description": "the FULL item description as it appears in the PDF (e.g. 'PALANCA DE UÑA', 'Cepillo fino Alambre de latón ondulado', 'BOQUILLA AIRMIX PORTAINSERTO INOX', 'JOGO DE CHAVES UMBRAKO'). Include brand and size/variant when present.",
       "quantity": "numeric quantity - the number of units ordered. NEVER zero.",
       "unitPrice": "unit price",
       "linePrice": "total amount for the line"
     }
   ]
 }
+
+DOCUMENT TYPE CLASSIFICATION:
+
+Set documentType="order" ONLY if the document is a PURCHASE ORDER (an instruction to deliver goods, with line items, quantities and prices). Typical signs:
+  * Words like "Pedido de compra", "Purchase order", "Encomenda", "Nota de Encomenda", "Bestellung", "Commande", "Orden de compra", "Plan de entregas"
+  * A clear PO number/reference
+  * A list of items with quantities and prices
+
+Set documentType="other" for anything else, including:
+  * Invoices (Fatura, Factura, Invoice, Rechnung) — these are payment requests, NOT orders
+  * Delivery notes (Albarán, Guia de remessa, Delivery note, Lieferschein)
+  * Quotes/offers (Presupuesto, Cotización, Quote, Orçamento)
+  * Complaints / claims (Reclamación, Reclamação, Complaint, Beschwerde)
+  * Information requests (Consulta, Inquiry)
+  * Certificates of conformity, quality certificates
+  * Marketing material, product catalogs
+  * Anything that is NOT a request to deliver goods
+
+If documentType is "other", you can return empty strings/empty array for all the other fields.
 
 CRITICAL RULES about hoffmannArticle:
 - Hoffmann references have 5-6 digits, optionally followed by a space and a suffix (numeric, fraction, or M-style code).
@@ -80,12 +103,12 @@ CRITICAL RULES about hoffmannArticle:
 CRITICAL RULES about quantity:
 - The quantity is the NUMBER OF UNITS ORDERED. It is ALWAYS greater than zero.
 - If the line shows two numbers like "0 5 PC" or "0 5 UN", the quantity is 5 (the non-zero one). The 0 is a column artifact, position number, or placeholder — NEVER the quantity.
-- If the line shows "5 PC", "3 UN", "2,00 Each", "1.00 UN", the number right before the unit (PC, UN, Each, pcs) is the quantity.
+- If the line shows "5 PC", "3 UN", "2,00 Each", "1.00 UN", "2 Peça", the number right before the unit is the quantity.
 - If you cannot confidently determine a positive quantity, return "" (empty string), never "0".
 
 FORMATTING RULES:
 - Use comma (,) as decimal separator for ALL numbers (e.g. "12,65" not "12.65"). Convert dots to commas.
-- poDate MUST be in DD/MM/YYYY format (e.g. "23/04/2026", "16/07/2024"). Convert any input format to this.
+- poDate MUST be in DD/MM/YYYY format. Convert any input format to this.
 - Return EVERY line item, never skip one, even if some fields are empty.
 - Do not include any text outside the JSON object.
 
@@ -115,6 +138,7 @@ def extract_with_llm(full_text: str, model: str = "gpt-4o-mini") -> dict:
     data = json.loads(raw)
 
     # Default every expected field
+    data.setdefault("documentType", "other")
     for f in ("orderNumber", "poDate", "buyer", "email", "phone",
               "customerName", "customerVat", "deliveryAddress"):
         data.setdefault(f, "")

@@ -20,6 +20,7 @@ import pdfplumber
 from .llm import extract_with_llm
 from .clients import find_client
 from .catalog import find_reference_by_name, build_ref_index, resolve_customer_part_number
+from .customer_codes import find_hoffmann_for_customer_code
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -244,7 +245,7 @@ def _build_error_response(
     }
 
 
-def _build_success_response(llm_data: dict, client_info: dict, po_date: str) -> str:
+def _build_success_response(llm_data: dict, client_info: dict, po_date: str) -> dict:
     head_fields = [
         "HEAD",
         client_info.get("client_number", ""),
@@ -273,16 +274,29 @@ def _build_success_response(llm_data: dict, client_info: dict, po_date: str) -> 
         ])
         line_rows.append(row)
 
-    return head + "\r\n" + "\r\n".join(line_rows) + "\r\n"
+    text = head + "\r\n" + "\r\n".join(line_rows) + "\r\n"
+
+    return {
+        "text": text,
+        "customer_name": llm_data.get("customerName", ""),
+        "order_number": llm_data.get("orderNumber", ""),
+    }
 
 
-def _fill_missing_refs_from_catalog(lines: list[dict], catalog: list[dict],
-                                    min_confidence: int = 80) -> list[dict]:
+def _fill_missing_refs_from_catalog(
+    lines: list[dict],
+    catalog: list[dict],
+    customer_vat: str = "",
+    has_own_codes: bool = False,
+    customer_codes_map: dict | None = None,
+    min_confidence: int = 80,
+) -> list[dict]:
     """For every line, ensure the Hoffmann reference EXISTS in the catalog.
     If not, blank it and try to resolve via:
-    1. The customer part number (normalized, space-insensitive lookup in catalog).
+    1. (Only if has_own_codes) Lookup in customer_codes_map by (CIF, customerPartNumber).
+    2. The customer part number (normalized, space-insensitive lookup in catalog).
        Example: '724201125' → '724201 125' if that ref exists.
-    2. Fuzzy match of the description against catalog product names (>= min_confidence).
+    3. Fuzzy match of the description against catalog product names (>= min_confidence).
     """
     if not catalog:
         return lines
@@ -313,8 +327,28 @@ def _fill_missing_refs_from_catalog(lines: list[dict], catalog: list[dict],
         if ref:
             continue
 
-        # Step 1: Try resolving from customerPartNumber
         cpn = str(line.get("customerPartNumber", "")).strip()
+
+        # Step 1: If client has own codes → try the customer-codes mapping
+        if has_own_codes and customer_vat and cpn and customer_codes_map:
+            mapped = find_hoffmann_for_customer_code(customer_vat, cpn, customer_codes_map)
+            if mapped:
+                # Validate the mapped ref exists in the Hoffmann catalog
+                if mapped in catalog_refs:
+                    line["hoffmannArticle"] = mapped
+                    line["_ref_source"] = f"customer-code-table ('{cpn}' → '{mapped}')"
+                    print(f"[extractor] Resolved via customer-codes table: '{cpn}' → '{mapped}'")
+                    continue
+                # If not in catalog, try removing spaces
+                resolved = ref_index.get(mapped.replace(" ", ""), "")
+                if resolved:
+                    line["hoffmannArticle"] = resolved
+                    line["_ref_source"] = f"customer-code-table ('{cpn}' → '{resolved}')"
+                    print(f"[extractor] Resolved via customer-codes table (normalized): '{cpn}' → '{resolved}'")
+                    continue
+                print(f"[extractor] customer-codes table mapped '{cpn}' to '{mapped}' but it's NOT in Hoffmann catalog")
+
+        # Step 2: Try resolving from customerPartNumber (space-insensitive in catalog)
         if cpn:
             resolved = resolve_customer_part_number(cpn, ref_index)
             if resolved:
@@ -323,7 +357,7 @@ def _fill_missing_refs_from_catalog(lines: list[dict], catalog: list[dict],
                 print(f"[extractor] Resolved customer part number: '{cpn}' → '{resolved}'")
                 continue
 
-        # Step 2: Fuzzy match by description
+        # Step 3: Fuzzy match by description
         desc = str(line.get("description", "")).strip()
         if not desc:
             continue
@@ -341,7 +375,12 @@ def _fill_missing_refs_from_catalog(lines: list[dict], catalog: list[dict],
 
 # ─── Main entry point ────────────────────────────────────────────────────────
 
-def extract_pdf(pdf_path: str, catalog: list[dict], clients: list[dict]) -> tuple[bool, object]:
+def extract_pdf(
+    pdf_path: str,
+    catalog: list[dict],
+    clients: list[dict],
+    customer_codes_map: dict | None = None,
+) -> tuple[bool, object]:
     """Returns (success, result). result is str on success, dict on error."""
 
     # ── 1. Extract raw text ─────────────────────────────────────────────
@@ -362,7 +401,8 @@ def extract_pdf(pdf_path: str, catalog: list[dict], clients: list[dict]) -> tupl
     llm_data = None
     try:
         llm_data = extract_with_llm(raw_text)
-        print(f"[extractor] LLM OK: orderNumber={llm_data.get('orderNumber')}, "
+        print(f"[extractor] LLM OK: documentType={llm_data.get('documentType')}, "
+              f"orderNumber={llm_data.get('orderNumber')}, "
               f"poDate={llm_data.get('poDate')}, "
               f"lines={len(llm_data.get('lines', []))}")
     except Exception as e:
@@ -373,6 +413,17 @@ def extract_pdf(pdf_path: str, catalog: list[dict], clients: list[dict]) -> tupl
             None, raw_text, client_info, "",
         )
 
+    # ── 2b. Check document type — if not an order, return ignored ───────
+    doc_type = (llm_data.get("documentType") or "other").lower()
+    if doc_type != "order":
+        return False, {
+            "status": "ignored",
+            "reason": f"Document is not a purchase order (detected as '{doc_type}')",
+            "documentType": doc_type,
+            "customerName": llm_data.get("customerName", ""),
+            "rawTextPreview": raw_text[:500],
+        }
+
     # ── 3. Normalize the PO date to DD/MM/YYYY ──────────────────────────
     po_date = _normalize_date(llm_data.get("poDate", ""))
 
@@ -381,17 +432,21 @@ def extract_pdf(pdf_path: str, catalog: list[dict], clients: list[dict]) -> tupl
     delivery_address = llm_data.get("deliveryAddress", "")
     client_info = find_client(customer_vat, delivery_address, clients, raw_text_fallback=raw_text)
 
-    # ── 5. Fill missing references via catalog name match ───────────────
+    # ── 5. Fill missing references via catalog ──────────────────────────
     lines = llm_data.get("lines", [])
-    lines = _fill_missing_refs_from_catalog(lines, catalog, min_confidence=80)
+    lines = _fill_missing_refs_from_catalog(
+        lines, catalog,
+        customer_vat=client_info.get("vat", customer_vat) or customer_vat,
+        has_own_codes=client_info.get("has_own_codes", False),
+        customer_codes_map=customer_codes_map,
+        min_confidence=80,
+    )
     llm_data["lines"] = lines
 
     # ── 6. Auto-correct quantities using linePrice / unitPrice ratio ────
     lines = _auto_correct_quantities(lines)
     llm_data["lines"] = lines
 
-    # ── 7. Validate ─────────────────────────────────────────────────────
-    issues = []
     # ── 7. Validate ─────────────────────────────────────────────────────
     issues = []
     if client_info.get("error"):
@@ -482,8 +537,12 @@ SUPPLEMENTARY TEXT:
     return lines
 
 
-def extract_pdfs_combined(pdf_paths: list[str], catalog: list[dict],
-                          clients: list[dict]) -> tuple[bool, object]:
+def extract_pdfs_combined(
+    pdf_paths: list[str],
+    catalog: list[dict],
+    clients: list[dict],
+    customer_codes_map: dict | None = None,
+) -> tuple[bool, object]:
     """
     Process several PDFs that belong to the SAME purchase order.
     Selects a main PDF (the one with orderNumber + priced lines) and uses the
@@ -520,6 +579,24 @@ def extract_pdfs_combined(pdf_paths: list[str], catalog: list[dict],
             "Could not read any of the submitted PDFs", None, "",
             {"client_number": "", "country": "", "address": ""}, "",
         )
+
+    # 1b. Check document types — if NO PDF is an order, return ignored
+    order_pdfs = [i for i in pdf_infos
+                  if (i.get("llm_data") or {}).get("documentType", "").lower() == "order"]
+    if not order_pdfs:
+        first_llm = next((i["llm_data"] for i in pdf_infos if i.get("llm_data")), None)
+        types_seen = sorted({(i.get("llm_data") or {}).get("documentType", "unknown")
+                             for i in pdf_infos})
+        return False, {
+            "status": "ignored",
+            "reason": f"None of the {len(pdf_infos)} submitted PDFs is a purchase order (types detected: {types_seen})",
+            "documentType": "other",
+            "customerName": (first_llm or {}).get("customerName", ""),
+            "rawTextPreview": (pdf_infos[0]["raw_text"][:500] if pdf_infos else ""),
+        }
+
+    # Filter to only orders for the rest of the analysis
+    pdf_infos = order_pdfs
 
     # 2. Identify candidates: PDFs with orderNumber AND at least one priced line
     def _has_po_content(info):
@@ -589,7 +666,13 @@ def extract_pdfs_combined(pdf_paths: list[str], catalog: list[dict],
 
     # 7. Fill missing refs from catalog (customer part number + name fuzzy match)
     lines = main_llm.get("lines", [])
-    lines = _fill_missing_refs_from_catalog(lines, catalog, min_confidence=80)
+    lines = _fill_missing_refs_from_catalog(
+        lines, catalog,
+        customer_vat=customer_vat,
+        has_own_codes=client_info.get("has_own_codes", False),
+        customer_codes_map=customer_codes_map,
+        min_confidence=80,
+    )
     main_llm["lines"] = lines
 
     # 8. Enrich STILL missing refs using supplementary PDFs
@@ -598,9 +681,14 @@ def extract_pdfs_combined(pdf_paths: list[str], catalog: list[dict],
             s["raw_text"] for s in supplementary
         )
         lines = _enrich_missing_refs_with_llm(lines, supp_text)
-        # After enrichment, try catalog lookup again in case the LLM returned a
-        # customer-style code that needs space insertion
-        lines = _fill_missing_refs_from_catalog(lines, catalog, min_confidence=80)
+        # After enrichment, try catalog lookup again
+        lines = _fill_missing_refs_from_catalog(
+            lines, catalog,
+            customer_vat=customer_vat,
+            has_own_codes=client_info.get("has_own_codes", False),
+            customer_codes_map=customer_codes_map,
+            min_confidence=80,
+        )
         main_llm["lines"] = lines
 
     # 9. Auto-correct quantities
