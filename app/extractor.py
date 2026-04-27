@@ -89,15 +89,45 @@ def _normalize_date(raw: str) -> str:
     return s
 
 
-def _normalize_number(s) -> str:
+def _normalize_number(s, force_two_decimals: bool = False) -> str:
+    """Normalize a numeric string with comma as decimal separator.
+
+    - Truncates to 2 decimal places (does NOT round up).
+      '236,6850'  -> '236,68'
+      '103,5000'  -> '103,50'
+      '2,999'     -> '2,99'
+    - If force_two_decimals=True, integers also get formatted with two zeros.
+      '5'  -> '5,00' when force_two_decimals=True
+      '5'  -> '5'    when force_two_decimals=False (default)
+    - Preserves the original number if it's not parseable.
+    """
     if s is None:
         return ""
     s = str(s).strip()
     if not s:
         return ""
-    if "." in s and "," not in s:
-        s = s.replace(".", ",")
-    return s
+
+    raw = s.replace(",", ".")
+    try:
+        n = float(raw)
+    except ValueError:
+        # Not a number — just swap dot to comma for consistency
+        if "." in s and "," not in s:
+            s = s.replace(".", ",")
+        return s
+
+    # Truncate towards zero, not round
+    sign = -1 if n < 0 else 1
+    n_abs = abs(n)
+    truncated = int(n_abs * 100) / 100.0
+    n = sign * truncated
+
+    # If force, always two decimals; otherwise integers stay clean.
+    if force_two_decimals:
+        return f"{n:.2f}".replace(".", ",")
+    if abs(n - round(n)) < 1e-9:
+        return str(int(round(n)))
+    return f"{n:.2f}".replace(".", ",")
 
 
 def _extract_raw_text(pdf_path: str) -> str:
@@ -267,10 +297,10 @@ def _build_success_response(llm_data: dict, client_info: dict, po_date: str) -> 
         row = "|".join([
             "LINE",
             str(line.get("hoffmannArticle", "")).strip(),
-            _normalize_number(line.get("quantity", "")),
+            _normalize_number(line.get("quantity", "")),  # qty: integer if whole
             "",  # customerArticle
-            _normalize_number(line.get("unitPrice", "")),
-            _normalize_number(line.get("linePrice", "")),
+            _normalize_number(line.get("unitPrice", ""), force_two_decimals=True),
+            _normalize_number(line.get("linePrice", ""), force_two_decimals=True),
         ])
         line_rows.append(row)
 
