@@ -66,15 +66,31 @@ def resolve_customer_part_number(customer_pn: str, ref_index: dict) -> str:
     that separates base and suffix) to a real Hoffmann reference by checking
     the no-space normalized index.
 
+    Tries several variants:
+      - As-is (no spaces): '724201125'
+      - With dots replaced by commas: '11415032,5'
+      - With commas replaced by dots: '11415032.5'
+
     Example: '724201125' → '724201 125' if '724201 125' exists in the catalog.
+    Example: '114150 3.25' → '114150 3,25' if catalog uses comma.
     """
     if not customer_pn or not ref_index:
         return ""
-    # Normalize: strip spaces
-    key = customer_pn.replace(" ", "").strip()
-    if not key:
+
+    # Build candidate keys (all without spaces)
+    base = customer_pn.replace(" ", "").strip()
+    if not base:
         return ""
-    return ref_index.get(key, "")
+
+    candidates = [
+        base,
+        base.replace(".", ","),  # dot → comma
+        base.replace(",", "."),  # comma → dot
+    ]
+    for key in candidates:
+        if key in ref_index:
+            return ref_index[key]
+    return ""
 
 
 def validate_reference(ref: str, catalog: list[dict]) -> bool:

@@ -94,9 +94,10 @@ CRITICAL RULES about hoffmannArticle:
   * Examples of customer-internal codes (DO NOT use as hoffmannArticle): "10078071" (Talgo), "576705W" / "576705 W" (TE), "00080218600" (Continental), "6074", "5388031" (supplier numbers)
 
 - Look for the Hoffmann reference SPECIFICALLY in:
-  * The description text itself (read each word)
+  * The description text itself (read each word carefully)
   * Fields labelled "Nº peça de fabricante" / "Manufacturer part number" / "Hersteller-Teilenummer"
   * Fields labelled with "HOFFMANN" or "HOLEX" near a code
+  * **After "REF:" or "Ref:" or "Ref.:"** inside the description. Example: "BROCA Ø3 HSS REF: 114150 3" → hoffmannArticle is "114150 3". Another example: "BROCA Ø3.25 HSS REF: 114150 3.25" → hoffmannArticle is "114150 3.25" (keep the dot/comma exactly as printed; the system will normalize later).
 
 - If the line shows ONLY a customer-internal code and the description does NOT contain a clear Hoffmann reference, return "" (empty string) for hoffmannArticle. The system will look it up later via the description.
 
