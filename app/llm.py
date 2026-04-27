@@ -105,7 +105,9 @@ CRITICAL RULES about hoffmannArticle:
     - "768800 140 TIJERA ELECTRICISTA" → hoffmannArticle is "768800 140"
     - "759800 - PALANCA DE UÑA" → hoffmannArticle is "759800"
     - "759856 600 CLAVERA" → hoffmannArticle is "759856 600"
-    Whenever a description starts with a 5-6 digit number (optionally followed by a separator and a suffix like "10X13", "140", "3.25", "M12", "1/2", "9", "-4"), that number IS the Hoffmann reference. Always extract it. The suffix can be alphanumeric.
+    - "162902 5,07 (ESCARIADOR HSS)" → hoffmannArticle is "162902 5,07"
+    - "162902 6,08 (ESCARIADOR HSS)" → hoffmannArticle is "162902 6,08"
+    Whenever a description starts with a 5-6 digit number (optionally followed by a separator and a suffix like "10X13", "140", "3.25", "5,07", "6,08", "M12", "1/2", "9", "-4"), that number IS the Hoffmann reference. Always extract it. The suffix can be alphanumeric or decimal with comma/dot. Do not treat the suffix as a price when it appears immediately after the 5-6 digit article base.
 
 - If the line shows ONLY a customer-internal code and the description does NOT contain a clear Hoffmann reference, return "" (empty string) for hoffmannArticle. The system will look it up later via the description.
 

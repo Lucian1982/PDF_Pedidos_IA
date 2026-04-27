@@ -191,6 +191,90 @@ def _auto_correct_quantities(lines: list[dict]) -> list[dict]:
     return lines
 
 
+
+def _normalize_ref_candidate(value: str) -> str:
+    """Normalize a Hoffmann reference candidate without losing decimal suffixes."""
+    if value is None:
+        return ""
+    s = str(value).strip()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"^(\d{5,6})\s*-\s*(\S+)$", r"\1 \2", s)
+    if re.match(r"^\d{5,6}\s+\d+[.]\d+$", s):
+        s = s.replace(".", ",")
+    return s
+
+
+def _resolve_ref_candidate(candidate: str, catalog_refs: set[str], ref_index: dict) -> str:
+    """Return the catalog reference matching a candidate, trying comma/dot/space/hyphen variants."""
+    cand = _normalize_ref_candidate(candidate)
+    if not cand:
+        return ""
+    variants = []
+    for v in [cand, cand.replace("-", " "), cand.replace(".", ","), cand.replace(",", ".")]:
+        v = _normalize_ref_candidate(v)
+        for item in (v, v.replace(" ", "").replace("-", "")):
+            if item and item not in variants:
+                variants.append(item)
+    for v in variants:
+        if v in catalog_refs:
+            return v
+        resolved = ref_index.get(v.replace(" ", "").replace("-", ""), "")
+        if resolved:
+            return resolved
+    return ""
+
+
+def _raw_text_ref_candidates(raw_text: str) -> list[str]:
+    """Extract Hoffmann-like references from raw PDF text in reading order.
+
+    Handles references with comma-decimal suffixes, for example:
+    162902 5,07 (ESCARIADOR HSS) and 162902 6,08 (ESCARIADOR HSS).
+    """
+    if not raw_text:
+        return []
+    candidates = []
+    seen = set()
+    pattern = re.compile(
+        r"\b(\d{5,6})\s+([A-Z]?[0-9]+(?:[,.][0-9]+)?(?:X[0-9]+)?|M\d+|\d+/\d+)\b(?=\s*[-(A-ZÁÉÍÓÚÜÑa-záéíóúüñ])",
+        re.IGNORECASE,
+    )
+    for m in pattern.finditer(raw_text):
+        cand = _normalize_ref_candidate(f"{m.group(1)} {m.group(2)}")
+        key = cand.replace(" ", "")
+        if key not in seen:
+            seen.add(key)
+            candidates.append(cand)
+    return candidates
+
+
+def _fill_missing_refs_from_raw_text(lines: list[dict], raw_text: str, catalog: list[dict]) -> list[dict]:
+    """Fill blank/invalid Hoffmann references using raw PDF text candidates in line order."""
+    if not lines or not raw_text or not catalog:
+        return lines
+    ref_index = build_ref_index(catalog)
+    catalog_refs = {c["ref"] for c in catalog}
+    resolved_candidates = []
+    for cand in _raw_text_ref_candidates(raw_text):
+        resolved = _resolve_ref_candidate(cand, catalog_refs, ref_index)
+        if resolved:
+            resolved_candidates.append(resolved)
+    if not resolved_candidates:
+        return lines
+    idx = 0
+    for line in lines:
+        current = str(line.get("hoffmannArticle", "")).strip()
+        current_resolved = _resolve_ref_candidate(current, catalog_refs, ref_index) if current else ""
+        if current_resolved:
+            line["hoffmannArticle"] = current_resolved
+            continue
+        if idx < len(resolved_candidates):
+            line["hoffmannArticle"] = resolved_candidates[idx]
+            line["_ref_source"] = f"raw-text-scan ('{resolved_candidates[idx]}')"
+            print(f"[extractor] Filled Hoffmann ref from raw text: '{resolved_candidates[idx]}'")
+            idx += 1
+    return lines
+
+
 def _validate_lines(lines: list[dict]) -> list[str]:
     issues = []
     if not lines:
@@ -549,8 +633,11 @@ def extract_pdf(
     delivery_address = llm_data.get("deliveryAddress", "")
     client_info = find_client(customer_vat, delivery_address, clients, raw_text_fallback=raw_text)
 
-    # ── 5. Fill missing references via catalog ──────────────────────────
+    # ── 5. Fill missing references via raw PDF text and catalog ──────────
     lines = llm_data.get("lines", [])
+    # First use the raw PDF text, because LLMs may drop decimal suffixes that
+    # look like prices, e.g. "162902 5,07" / "162902 6,08".
+    lines = _fill_missing_refs_from_raw_text(lines, raw_text, catalog)
     lines = _fill_missing_refs_from_catalog(
         lines, catalog,
         customer_vat=client_info.get("vat", customer_vat) or customer_vat,
