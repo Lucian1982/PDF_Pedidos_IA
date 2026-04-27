@@ -417,8 +417,65 @@ def _fill_missing_refs_from_catalog(
                 print(f"[extractor] Resolved customer part number: '{cpn}' → '{resolved}'")
                 continue
 
-        # Step 3: Fuzzy match by description
+        # Step 2b: Scan the description text for Hoffmann-like patterns
+        # (5-6 digits + optional separator + optional suffix) and check each
+        # candidate against the catalog. This is a safety net for cases where
+        # the LLM did not extract the reference even though it was in the description.
         desc = str(line.get("description", "")).strip()
+        if desc:
+            # Match patterns like:  XXXXXX-Y, XXXXXX YYY, XXXXXX YY,YY, XXXXXX YYXY,
+            # XXXXXX, XXXXXX MYY, XXXXXX Y/Y
+            pattern = re.compile(
+                r'\b(\d{5,6})(?:[\s\-]+([A-Z0-9][A-Z0-9.,/]*[A-Z0-9]|[A-Z0-9]))?',
+                re.IGNORECASE,
+            )
+            found_in_desc = False
+            for m in pattern.finditer(desc):
+                base = m.group(1)
+                suffix = m.group(2) or ""
+                # Build several candidate strings to test
+                candidates_to_try = []
+                if suffix:
+                    candidates_to_try.extend([
+                        f"{base} {suffix}",       # "768800 140"
+                        f"{base}-{suffix}",       # "768800-140"
+                        f"{base}{suffix}",        # "768800140"
+                        f"{base} {suffix.replace('.', ',')}",
+                        f"{base} {suffix.replace(',', '.')}",
+                    ])
+                else:
+                    candidates_to_try.append(base)
+
+                for cand in candidates_to_try:
+                    if cand in catalog_refs:
+                        line["hoffmannArticle"] = cand
+                        line["_ref_source"] = f"description-scan ('{cand}' from desc)"
+                        print(f"[extractor] Found Hoffmann ref by scanning description: '{cand}' in '{desc[:60]}'")
+                        found_in_desc = True
+                        break
+                    # Try the index lookup too (no-space form)
+                    no_space = cand.replace(" ", "").replace("-", "")
+                    resolved = ref_index.get(no_space, "")
+                    if not resolved:
+                        # Try with dot/comma swap
+                        for variant in (no_space.replace(".", ","), no_space.replace(",", ".")):
+                            resolved = ref_index.get(variant, "")
+                            if resolved:
+                                break
+                    if resolved:
+                        line["hoffmannArticle"] = resolved
+                        line["_ref_source"] = f"description-scan ('{cand}' → '{resolved}')"
+                        print(f"[extractor] Found Hoffmann ref by scanning description: '{cand}' → '{resolved}'")
+                        found_in_desc = True
+                        break
+
+                if found_in_desc:
+                    break
+
+            if found_in_desc:
+                continue
+
+        # Step 3: Fuzzy match by description
         if not desc:
             continue
         found, score = find_reference_by_name(desc, catalog, min_confidence=min_confidence)
