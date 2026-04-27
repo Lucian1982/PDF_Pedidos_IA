@@ -275,10 +275,14 @@ def find_client(
 
     # ── Step 4: Multiple rows with same VAT → filter by postal code ────
     pdf_postal = extract_postal_code(delivery_address)
+    print(f"[clients] VAT matched {len(matching)} rows; postal codes available: {[c['postal_code'] for c in matching]}")
+    print(f"[clients] Postal code from PDF delivery address: '{pdf_postal}' (extracted from: '{delivery_address[:80]}')")
     if pdf_postal:
         by_postal = [c for c in matching if c["postal_code"] == pdf_postal]
+        print(f"[clients] After filter by postal code '{pdf_postal}': {len(by_postal)} rows")
         if len(by_postal) == 1:
             c = by_postal[0]
+            print(f"[clients] Single match by postal → client_number={c['client_number']}")
             return {
                 "client_number": c["client_number"],
                 "country": c["country"],
@@ -287,6 +291,8 @@ def find_client(
             }
         if by_postal:
             matching = by_postal  # narrow down for step 5
+        else:
+            print(f"[clients] No row matched postal '{pdf_postal}' exactly. Continuing with all {len(matching)} rows.")
 
     # ── Step 5: Still multiple → fuzzy match addresses, >= 90% ─────────
     if delivery_address:
@@ -300,16 +306,26 @@ def find_client(
         if result:
             best_addr = result[0]
             best = next(c for c in matching if c["address"] == best_addr)
+            print(f"[clients] Fuzzy match → '{best_addr[:60]}' score={result[1]:.1f}")
             return {
                 "client_number": best["client_number"],
                 "country": best["country"],
                 "address": best["address"],
                 "error": "",
             }
+        # Log the best score we got, even though it's below threshold
+        any_result = process.extractOne(
+            delivery_address, addresses, scorer=fuzz.token_set_ratio
+        )
+        if any_result:
+            print(f"[clients] Fuzzy best score: {any_result[1]:.1f}% (need ≥90) → no match")
+            print(f"[clients]   PDF address: '{delivery_address}'")
+            print(f"[clients]   Best candidate: '{any_result[0]}'")
 
     # If we got here: VAT found but cannot disambiguate the specific address
+    postal_info = f"PDF postal '{pdf_postal}' vs available {sorted({c['postal_code'] for c in matching})}" if pdf_postal else "no postal code in PDF address"
     empty_error["error"] = (
         f"Customer VAT '{matched_vat}' matches {len(matching)} rows but the "
-        f"delivery address could not be matched with >= 90% similarity"
+        f"delivery address could not be matched. {postal_info}"
     )
     return empty_error
