@@ -98,6 +98,14 @@ CRITICAL RULES about hoffmannArticle:
   * Fields labelled "Nº peça de fabricante" / "Manufacturer part number" / "Hersteller-Teilenummer"
   * Fields labelled with "HOFFMANN" or "HOLEX" near a code
   * **After "REF:" or "Ref:" or "Ref.:"** inside the description. Example: "BROCA Ø3 HSS REF: 114150 3" → hoffmannArticle is "114150 3". Another example: "BROCA Ø3.25 HSS REF: 114150 3.25" → hoffmannArticle is "114150 3.25" (keep the dot/comma exactly as printed; the system will normalize later).
+  * **AT THE BEGINNING of the description line**, before the textual description. This is VERY common. Examples:
+    - "663000-4 DESTORNILLADOR ELEC PLANO" → hoffmannArticle is "663000-4"
+    - "610600 10X13 LLAVE PLANA" → hoffmannArticle is "610600 10X13"
+    - "613600 10 LAVE COMBINADA" → hoffmannArticle is "613600 10"
+    - "768800 140 TIJERA ELECTRICISTA" → hoffmannArticle is "768800 140"
+    - "759800 - PALANCA DE UÑA" → hoffmannArticle is "759800"
+    - "759856 600 CLAVERA" → hoffmannArticle is "759856 600"
+    Whenever a description starts with a 5-6 digit number (optionally followed by a separator and a suffix like "10X13", "140", "3.25", "M12", "1/2", "9", "-4"), that number IS the Hoffmann reference. Always extract it. The suffix can be alphanumeric.
 
 - If the line shows ONLY a customer-internal code and the description does NOT contain a clear Hoffmann reference, return "" (empty string) for hoffmannArticle. The system will look it up later via the description.
 

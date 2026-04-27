@@ -342,13 +342,22 @@ def _fill_missing_refs_from_catalog(
             # Try several normalizations:
             # 1. Without spaces (e.g. '6260899' → '626089 9')
             # 2. With dot replaced by comma (e.g. '114150 3.25' → '114150 3,25')
-            # 3. Both (no spaces AND dot→comma)
+            # 3. With hyphen replaced by space (e.g. '663000-4' → '663000 4')
+            # 4. Combinations
             tried = []
-            for variant in (
-                ref.replace(" ", ""),                        # '6260899'
-                ref.replace(".", ","),                        # '114150 3,25'
-                ref.replace(" ", "").replace(".", ","),       # '1141503,25'
-            ):
+            variants = set()
+            v1 = ref
+            v2 = ref.replace("-", " ")          # '663000-4' → '663000 4'
+            v3 = ref.replace(".", ",")          # '114150 3.25' → '114150 3,25'
+            v4 = ref.replace(",", ".")          # '114150 3,25' → '114150 3.25'
+            v5 = v2.replace(".", ",")           # combined hyphen + dot/comma
+            v6 = v2.replace(",", ".")
+            for v in (v1, v2, v3, v4, v5, v6):
+                variants.add(v)
+                variants.add(v.replace(" ", ""))  # also try compact form
+
+            found_match = False
+            for variant in variants:
                 tried.append(variant)
                 # Direct lookup with the variant
                 if variant in catalog_refs:
@@ -356,6 +365,7 @@ def _fill_missing_refs_from_catalog(
                     line["_ref_source"] = f"normalized ('{ref}' → '{variant}')"
                     print(f"[extractor] Normalized LLM ref: '{ref}' → '{variant}'")
                     ref = variant
+                    found_match = True
                     break
                 # Index lookup (treats variant as no-space key)
                 resolved = ref_index.get(variant, "")
@@ -364,10 +374,11 @@ def _fill_missing_refs_from_catalog(
                     line["_ref_source"] = f"normalized ('{ref}' → '{resolved}')"
                     print(f"[extractor] Normalized LLM ref via index: '{ref}' → '{resolved}'")
                     ref = resolved
+                    found_match = True
                     break
 
-            if ref not in catalog_refs:
-                print(f"[extractor] LLM ref '{ref}' NOT in catalog (tried: {tried}) → discarding and retrying")
+            if not found_match:
+                print(f"[extractor] LLM ref '{ref}' NOT in catalog (tried: {sorted(tried)}) → discarding and retrying")
                 line["hoffmannArticle"] = ""
                 line["_ref_source"] = f"LLM ref '{ref}' not in catalog (discarded)"
                 ref = ""
