@@ -868,8 +868,11 @@ def extract_pdfs_combined(
     delivery_address = main_llm.get("deliveryAddress", "")
     client_info = find_client(customer_vat, delivery_address, clients, raw_text_fallback=main_text)
 
-    # 7. Fill missing refs from catalog (customer part number + name fuzzy match)
+    # 7. Fill missing refs from raw PDF text first, then from catalog
+    # Raw text is important for DIKAR-like lines where the LLM may keep only
+    # "162902" in the description and drop the decimal suffix "5,07" / "6,08".
     lines = main_llm.get("lines", [])
+    lines = _fill_missing_refs_from_raw_text(lines, main_text, catalog)
     lines = _fill_missing_refs_from_catalog(
         lines, catalog,
         customer_vat=customer_vat,
