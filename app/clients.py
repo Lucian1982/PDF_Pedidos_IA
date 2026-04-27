@@ -23,7 +23,9 @@ from rapidfuzz import fuzz, process
 def load_clients(path: str) -> list[dict]:
     """
     Load clients Excel with columns:
-      VAT/NIF/CIF | Codigo Postal | Direccion envio | Numero clinete | Pais | Codigos Propios
+      VAT/NIF/CIF | VAT/NIF/CIF_2 | Codigo Postal | Direccion envio | Numero cliente | Pais | Codigos Propios
+    The VAT/NIF/CIF_2 column holds the VAT WITHOUT the country prefix and letters,
+    used as a fallback when the customer omits the prefix in the PO.
     Returns list of dicts with normalized keys.
     """
     df = pd.read_excel(path, dtype=str)
@@ -31,9 +33,15 @@ def load_clients(path: str) -> list[dict]:
 
     col_map = {}
     for c in df.columns:
-        cl = c.lower()
-        if ("vat" in cl or "nif" in cl or "cif" in cl) and "vat/nif/cif" in cl.replace(" ", ""):
-            col_map["vat"] = c
+        cl = c.lower().replace(" ", "")
+        # "VAT/NIF/CIF_2" must be detected BEFORE "VAT/NIF/CIF" because
+        # both contain the substring 'vat/nif/cif'.
+        if "vat/nif/cif_2" in cl or "vat/nif/cif2" in cl or cl.endswith("_2") and ("vat" in cl or "nif" in cl or "cif" in cl):
+            col_map["vat2"] = c
+        elif "vat/nif/cif" in cl and "vat" not in col_map.get("_already_main", ""):
+            # main VAT column (must contain "vat/nif/cif" but not the "_2")
+            if "vat" not in col_map:
+                col_map["vat"] = c
         elif col_map.get("vat") is None and ("vat" in cl or "nif" in cl or "cif" in cl):
             col_map["vat"] = c
         elif "codigo" in cl and "postal" in cl:
@@ -47,22 +55,31 @@ def load_clients(path: str) -> list[dict]:
         elif "codigos" in cl and "propios" in cl:
             col_map["own_codes_flag"] = c
 
+    print(f"[clients] Detected columns: {col_map}")
+
     clients = []
     for _, row in df.iterrows():
         vat = str(row.get(col_map.get("vat", ""), "")).strip().upper()
+        vat2 = str(row.get(col_map.get("vat2", ""), "")).strip().upper() if col_map.get("vat2") else ""
         postal = str(row.get(col_map.get("postal", ""), "")).strip()
         addr = str(row.get(col_map.get("address", ""), "")).strip()
         num = str(row.get(col_map.get("number", ""), "")).strip()
         country = str(row.get(col_map.get("country", ""), "")).strip().upper()
         own_codes_raw = str(row.get(col_map.get("own_codes_flag", ""), "")).strip().upper() if col_map.get("own_codes_flag") else ""
-        # "Codigos Propios" is True when the cell contains 'SI', 'YES', 'TRUE', '1'
         has_own_codes = own_codes_raw in ("SI", "SÍ", "YES", "TRUE", "1", "X")
+
+        # Skip "nan" values from pandas
+        if vat in ("NAN", ""):
+            vat = ""
+        if vat2 in ("NAN", ""):
+            vat2 = ""
 
         if not vat or not num:
             continue
 
         clients.append({
             "vat": _normalize_vat(vat),
+            "vat2": _normalize_vat(vat2) if vat2 else "",
             "postal_code": postal,
             "address": addr,
             "client_number": num,
@@ -221,6 +238,22 @@ def find_client(
             if rows:
                 matching = rows
                 matched_vat = candidate
+                break
+
+    # ── Step 2b: Fallback to VAT/NIF/CIF_2 (just digits, no letters) ───
+    # Used when the customer omits the country prefix and letters in the PO,
+    # e.g. PDF says "8087173" but the client is registered as "ESB08087173".
+    if not matching:
+        for candidate in vat_candidates:
+            # Strip everything that is not a digit and try matching against vat2
+            digits_only = re.sub(r'[^0-9]', '', candidate)
+            if not digits_only:
+                continue
+            rows = [c for c in clients if c.get("vat2") and c["vat2"] == digits_only]
+            if rows:
+                matching = rows
+                matched_vat = candidate
+                print(f"[clients] Matched via VAT/NIF/CIF_2: '{candidate}' → digits '{digits_only}'")
                 break
 
     if not matching:
